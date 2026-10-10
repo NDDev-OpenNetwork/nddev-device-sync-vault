@@ -19,7 +19,7 @@ pub struct RecordView {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {
+pub enum VaultError {
     #[error("vault_invalid_input")]
     Invalid,
     #[error("vault_locked")]
@@ -34,7 +34,7 @@ pub enum Error {
     KeyExists,
 }
 
-impl Error {
+impl VaultError {
     /// Stable presentation class; never an underlying driver/secret message.
     pub fn code(&self) -> String {
         self.to_string()

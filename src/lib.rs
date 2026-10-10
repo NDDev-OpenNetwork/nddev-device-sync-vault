@@ -3,6 +3,6 @@ mod client;
 mod codec;
 pub use client::VaultClient;
 pub mod view;
-pub use view::{Error, RecordView, VaultView};
+pub use view::{RecordView, VaultError as Error, VaultView};
 pub mod crypto;
 mod journal;
