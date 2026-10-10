@@ -18,24 +18,8 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
-#[derive(Clone, Default)]
-pub struct VaultView {
-    pub unlocked: bool,
-    pub key_id: String,
-    pub pending: u32,
-    pub conflicts: u32,
-    pub cursor: u64,
-    pub last_sync_at: u64,
-    pub pairing_code: String,
-}
-#[derive(Clone)]
-pub struct RecordView {
-    pub id: String,
-    pub title: String,
-    pub username: String,
-    pub revision: u64,
-    pub conflicted: bool,
-}
+use crate::view::{RecordView, VaultView};
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
