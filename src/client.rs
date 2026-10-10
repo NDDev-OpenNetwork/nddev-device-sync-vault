@@ -504,10 +504,11 @@ impl VaultClient {
             return Err(Error::Unavailable);
         }
         drop(lock);
-        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
-        view.pairing_code.clear();
-        view.pairing_fingerprint.clear();
-        drop(view);
+        {
+            let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+            view.pairing_code.clear();
+            view.pairing_fingerprint.clear();
+        }
         self.update_view().await
     }
 }
