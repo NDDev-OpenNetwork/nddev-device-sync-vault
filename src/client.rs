@@ -18,7 +18,7 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
-use crate::view::{RecordView, VaultView};
+use crate::view::{PairingPeer, RecordView, VaultView};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -121,11 +121,9 @@ impl VaultClient {
         let mut pairing = self.pairing.lock().unwrap_or_else(|e| e.into_inner());
         if pairing.as_ref().is_some_and(|pairing| !pairing.active()) {
             pairing.take();
-            self.view
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pairing_code
-                .clear();
+            let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+            view.pairing_code.clear();
+            view.pairing_fingerprint.clear();
         }
         drop(pairing);
         self.view.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -211,6 +209,11 @@ impl VaultClient {
     /// Existing native key material is never replaced, even after uncertainty.
     pub async fn create(&self) -> Result<VaultView, Error> {
         let _permit = self.admitted()?;
+        tokio::time::timeout(std::time::Duration::from_secs(60), self.create_inner())
+            .await
+            .map_err(dependency)?
+    }
+    async fn create_inner(&self) -> Result<VaultView, Error> {
         self.discover_key().await?;
         let established = self
             .expected_key
@@ -413,28 +416,50 @@ impl VaultClient {
         let _permit = self.admitted()?;
         let pairing = Pairing::start(&self.scope.device)?;
         let code = pairing.code()?;
+        let fingerprint = crate::crypto::invitation_fingerprint(pairing.invitation())?;
         *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = Some(pairing);
-        self.view
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pairing_code = code.clone();
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        view.pairing_code = code.clone();
+        view.pairing_fingerprint = fingerprint;
         Ok(code)
     }
-    pub async fn grant_pairing(&self, code: String) -> Result<String, Error> {
-        let _permit = self.admitted()?;
-        self.identity.refresh_devices().await.map_err(dependency)?;
-        self.discover_key().await?;
+    async fn pairing_peer(&self, code: &str) -> Result<(Invitation, PairingPeer), Error> {
         if code.len() > 2048 {
             return Err(Error::Invalid);
         }
-        let invitation: Invitation = serde_json::from_str(&code).map_err(|_| Error::Invalid)?;
-        // The owner explicitly chooses the freshly verified recipient in UI.
-        let peer = self.identity.view().devices.into_iter().any(|device| {
-            device.device_id == invitation.recipient_device && !device.revoked && !device.is_current
-        });
-        if !peer {
-            return Err(Error::Invalid);
-        }
+        let invitation: Invitation = serde_json::from_str(code).map_err(|_| Error::Invalid)?;
+        let fingerprint = crate::crypto::invitation_fingerprint(&invitation)?;
+        self.identity.refresh_devices().await.map_err(dependency)?;
+        let peer = self
+            .identity
+            .view()
+            .devices
+            .into_iter()
+            .find(|device| {
+                device.device_id == invitation.recipient_device
+                    && !device.revoked
+                    && !device.is_current
+            })
+            .ok_or(Error::Invalid)?;
+        Ok((
+            invitation,
+            PairingPeer {
+                device_id: peer.device_id,
+                name: peer.display_name,
+                fingerprint,
+            },
+        ))
+    }
+    /// Show the verified recipient and exact invitation fingerprint before the
+    /// owner approves. Granting checks the recipient again after confirmation.
+    pub async fn preview_pairing(&self, code: String) -> Result<PairingPeer, Error> {
+        let _permit = self.admitted()?;
+        Ok(self.pairing_peer(&code).await?.1)
+    }
+    pub async fn grant_pairing(&self, code: String) -> Result<String, Error> {
+        let _permit = self.admitted()?;
+        let (invitation, _) = self.pairing_peer(&code).await?;
+        self.discover_key().await?;
         let key = self.key().await?.ok_or(Error::Locked)?;
         serde_json::to_string(&crate::crypto::grant(&self.scope, &key, invitation)?)
             .map_err(dependency)
@@ -479,11 +504,11 @@ impl VaultClient {
             return Err(Error::Unavailable);
         }
         drop(lock);
-        self.view
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pairing_code
-            .clear();
+        {
+            let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+            view.pairing_code.clear();
+            view.pairing_fingerprint.clear();
+        }
         self.update_view().await
     }
 }

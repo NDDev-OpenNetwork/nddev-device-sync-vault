@@ -157,6 +157,23 @@ pub struct Invitation {
     pub public_key: String,
     pub challenge: String,
 }
+/// A public, canonical digest for the owner to compare across the two devices.
+pub fn invitation_fingerprint(invitation: &Invitation) -> Result<String, Error> {
+    use sha2::{Digest, Sha256};
+    if invitation.version != 1 {
+        return Err(Error::Invalid);
+    }
+    nddev_device_sync_domain::DeviceId::new(&invitation.recipient_device)
+        .map_err(|_| Error::Invalid)?;
+    decode::<32>(&invitation.public_key)?;
+    decode::<32>(&invitation.challenge)?;
+    let bytes = serde_json::to_vec(invitation).map_err(|_| Error::Invalid)?;
+    let digest = Sha256::digest(bytes);
+    Ok(digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grant {
@@ -397,6 +414,12 @@ mod tests {
         let key = VaultKey::generate().unwrap();
         let receiver = Pairing::start(&second.device).unwrap();
         let invitation: Invitation = serde_json::from_str(&receiver.code().unwrap()).unwrap();
+        let fingerprint = invitation_fingerprint(&invitation).unwrap();
+        let mut changed: Invitation = serde_json::from_str(&receiver.code().unwrap()).unwrap();
+        changed.recipient_device = "other-device".into();
+        assert_ne!(invitation_fingerprint(&changed).unwrap(), fingerprint);
+        changed.version = 2;
+        assert!(invitation_fingerprint(&changed).is_err());
         let wrapped = grant(&first, &key, invitation).unwrap();
         assert!(
             !wrapped
