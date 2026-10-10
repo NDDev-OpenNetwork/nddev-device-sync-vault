@@ -20,3 +20,10 @@ pub enum Error {
     #[error("vault_key_exists")]
     KeyExists,
 }
+
+impl Error {
+    /// Stable presentation class; never an underlying driver/secret message.
+    pub fn code(&self) -> String {
+        self.to_string()
+    }
+}
