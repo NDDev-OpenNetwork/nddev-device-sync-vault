@@ -26,6 +26,30 @@ pub struct PairingPeer {
     pub fingerprint: String,
 }
 
+#[derive(Clone)]
+pub struct StateView {
+    pub kind: String,
+    pub id: String,
+    pub device_id: String,
+    pub label: String,
+    pub version: String,
+    pub platform: String,
+    pub reachability: String,
+    pub configured: bool,
+    pub checked_at_ms: u64,
+    pub observed_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub error_class: String,
+    pub revision: u64,
+    pub conflicted: bool,
+}
+#[derive(Clone)]
+pub struct StatePage {
+    pub items: Vec<StateView>,
+    pub next_after: String,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum VaultError {
     #[error("vault_invalid_input")]
