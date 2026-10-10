@@ -18,6 +18,13 @@ pub struct RecordView {
     pub conflicted: bool,
 }
 
+#[derive(Clone)]
+pub struct PairingPeer {
+    pub device_id: String,
+    pub name: String,
+    pub fingerprint: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum VaultError {
     #[error("vault_invalid_input")]

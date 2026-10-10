@@ -2,7 +2,7 @@
 //! revision/receipt metadata live here. Vault/signing/session keys stay native.
 use crate::Error;
 use nddev_device_sync_accounts::sync_wire as wire;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use std::{
     fs::{self, File, OpenOptions},
     path::PathBuf,
@@ -66,7 +66,14 @@ impl Journal {
         Ok(journal)
     }
     fn connection(&self) -> Result<Connection, Error> {
-        let connection = Connection::open(&self.path).map_err(failed)?;
+        let connection = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(failed)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -389,5 +396,19 @@ mod tests {
                 .windows(48)
                 .any(|value| value == key.native_secret().as_slice())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn actual_sqlite_refuses_a_replaced_database_symlink() {
+        let owned = Owned(std::env::temp_dir().join(format!("nds-vault-{}", uuid::Uuid::new_v4())));
+        let path = owned.0.join("journal.db");
+        let journal = Journal::open(path.clone()).unwrap();
+        let original = owned.0.join("original.db");
+        std::fs::rename(&path, &original).unwrap();
+        std::os::unix::fs::symlink(&original, &path).unwrap();
+        // A retained handle must refuse the replacement on every connection,
+        // even though its initial open validated the original regular file.
+        assert!(journal.cursor().is_err());
     }
 }
