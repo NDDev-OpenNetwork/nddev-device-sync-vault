@@ -1,0 +1,6 @@
+[licenses]
+allow = ["AGPL-3.0-only", "Apache-2.0", "BSD-3-Clause", "CDLA-Permissive-2.0", "ISC", "MIT", "MIT-0", "Unicode-3.0", "Zlib"]
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = ["https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", "https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git", "https://github.com/NDDev-OpenNetwork/nddev-device-sync-protocol.git", "https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability"]
