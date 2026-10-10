@@ -189,6 +189,29 @@ impl Journal {
         tx.commit().map_err(failed)?;
         Ok(operation.operation_id)
     }
+    pub fn state_page(
+        &self,
+        after: Option<(String, String)>,
+    ) -> Result<Vec<(String, String, Entity)>, Error> {
+        let connection = self.connection()?;
+        let (kind, id) = after.map_or((None, None), |(kind, id)| (Some(kind), Some(id)));
+        let mut query=connection.prepare("SELECT kind,id,revision,body,EXISTS(SELECT 1 FROM conflicts WHERE kind=entities.kind AND entity_id=entities.id) FROM entities WHERE kind IN ('device_state','module_state','account_state') AND (?1 IS NULL OR (kind,id)>(?1,?2)) ORDER BY kind,id LIMIT 51").map_err(failed)?;
+        query
+            .query_map(params![kind, id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    Entity {
+                        revision: row.get(2)?,
+                        body: row.get(3)?,
+                        conflicted: row.get(4)?,
+                    },
+                ))
+            })
+            .map_err(failed)?
+            .collect::<Result<_, _>>()
+            .map_err(failed)
+    }
     pub fn acknowledge(&self, id: &str, result: &[u8]) -> Result<(), Error> {
         let outcome: wire::Sync = serde_json::from_slice(result).map_err(|_| Error::Invalid)?;
         let mut connection = self.connection()?;
