@@ -8,6 +8,7 @@ pub struct VaultView {
     pub cursor: u64,
     pub last_sync_at: u64,
     pub pairing_code: String,
+    pub pairing_fingerprint: String,
 }
 #[derive(Clone)]
 pub struct RecordView {
@@ -16,6 +17,13 @@ pub struct RecordView {
     pub username: String,
     pub revision: u64,
     pub conflicted: bool,
+}
+
+#[derive(Clone)]
+pub struct PairingPeer {
+    pub device_id: String,
+    pub name: String,
+    pub fingerprint: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
