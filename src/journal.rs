@@ -42,6 +42,12 @@ impl Journal {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(failed)?;
         }
+        // Native platform roots can have system-owned aliases (e.g. macOS
+        // /var -> /private/var). Resolve the directory once, while still refusing
+        // database symlinks on every subsequent SQLite connection.
+        let path = fs::canonicalize(parent)
+            .map_err(failed)?
+            .join(path.file_name().ok_or(Error::Invalid)?);
         if fs::symlink_metadata(&path).is_ok_and(|metadata| !metadata.file_type().is_file()) {
             return Err(Error::Invalid);
         }
