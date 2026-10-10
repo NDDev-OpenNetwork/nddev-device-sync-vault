@@ -121,11 +121,9 @@ impl VaultClient {
         let mut pairing = self.pairing.lock().unwrap_or_else(|e| e.into_inner());
         if pairing.as_ref().is_some_and(|pairing| !pairing.active()) {
             pairing.take();
-            self.view
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pairing_code
-                .clear();
+            let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+            view.pairing_code.clear();
+            view.pairing_fingerprint.clear();
         }
         drop(pairing);
         self.view.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -418,11 +416,11 @@ impl VaultClient {
         let _permit = self.admitted()?;
         let pairing = Pairing::start(&self.scope.device)?;
         let code = pairing.code()?;
+        let fingerprint = crate::crypto::invitation_fingerprint(pairing.invitation())?;
         *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = Some(pairing);
-        self.view
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pairing_code = code.clone();
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        view.pairing_code = code.clone();
+        view.pairing_fingerprint = fingerprint;
         Ok(code)
     }
     async fn pairing_peer(&self, code: &str) -> Result<(Invitation, PairingPeer), Error> {
@@ -506,11 +504,10 @@ impl VaultClient {
             return Err(Error::Unavailable);
         }
         drop(lock);
-        self.view
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pairing_code
-            .clear();
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        view.pairing_code.clear();
+        view.pairing_fingerprint.clear();
+        drop(view);
         self.update_view().await
     }
 }

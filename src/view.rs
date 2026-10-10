@@ -8,6 +8,7 @@ pub struct VaultView {
     pub cursor: u64,
     pub last_sync_at: u64,
     pub pairing_code: String,
+    pub pairing_fingerprint: String,
 }
 #[derive(Clone)]
 pub struct RecordView {
