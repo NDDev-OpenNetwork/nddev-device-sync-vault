@@ -18,8 +18,8 @@ serde_json = "1"
 zeroize = { version = "1.8", features = ["serde"] }
 thiserror = "2"
 uuid = { version = "1.27", features = ["v4"] }
-nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "e87368c53bd524caeabc1e14743c96fcfd87da77" }
-nddev-device-sync-accounts = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git", rev = "66795c6dfc074675082b0f80e6d0681693388618" }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "3e5b1db049c47799123847c9831f025cb226c69c" }
+nddev-device-sync-accounts = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git", rev = "65ad593d6116a992934d1b06f3874fadfb89c37b" }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["libsqlite3-sys", "bundled", "fallible_uint"] }
 tokio = { version = "1.53", features = ["rt", "sync", "time"] }
 sha2 = "0.10"
