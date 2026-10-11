@@ -272,11 +272,19 @@ impl VaultClient {
         };
         operation.payload = key.encrypt(&self.scope, &operation, plaintext)?;
         let bytes = codec::body(&operation)?;
-        let id = self
+        let receipt = self
             .local(move |journal| journal.enqueue(bytes, expected_cursor))
             .await?;
-        self.update_view().await?;
-        Ok(id)
+        // The transaction has committed. No subsequent native-store/SQLite read
+        // may turn this durable success into an apparent failed mutation.
+        let mut view = self.view.lock().unwrap_or_else(|error| error.into_inner());
+        view.unlocked = true;
+        view.key_id = key.id();
+        view.pending = receipt.pending;
+        view.conflicts = receipt.conflicts;
+        view.cursor = receipt.cursor;
+        view.catching_up = true;
+        Ok(receipt.id)
     }
     pub async fn share_clipboard(&self, text: Zeroizing<String>) -> Result<String, Error> {
         let _permit = self.admitted()?;
@@ -460,6 +468,7 @@ impl VaultClient {
         expected_cursor: u64,
         use_conflict: bool,
     ) -> Result<String, Error> {
+        nddev_device_sync_domain::ModuleId::new(&id).map_err(|_| Error::Invalid)?;
         let _permit = self.admitted()?;
         if self.snapshot().catching_up || self.snapshot().last_sync_at == 0 {
             return Err(Error::Busy);
@@ -502,6 +511,7 @@ impl VaultClient {
         .await
     }
     pub async fn delete_record(&self, id: String, expected_revision: u64) -> Result<String, Error> {
+        nddev_device_sync_domain::ModuleId::new(&id).map_err(|_| Error::Invalid)?;
         let _permit = self.admitted()?;
         let lookup = id.clone();
         let entity = self
@@ -562,6 +572,7 @@ impl VaultClient {
     /// Native use only. The presentation wrapper delegates to native clipboard
     /// or declared provider adapters; it never returns this value through FFI.
     pub async fn native_secret(&self, id: String) -> Result<Zeroizing<String>, Error> {
+        nddev_device_sync_domain::ModuleId::new(&id).map_err(|_| Error::Invalid)?;
         let _permit = self.admitted()?;
         let key = self.key().await?.ok_or(Error::Locked)?;
         let entity = self

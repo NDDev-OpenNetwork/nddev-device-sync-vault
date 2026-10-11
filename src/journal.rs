@@ -23,6 +23,12 @@ pub struct Entity {
     pub conflicted: bool,
     pub server_seq: u64,
 }
+pub struct Enqueued {
+    pub id: String,
+    pub pending: u32,
+    pub conflicts: u32,
+    pub cursor: u64,
+}
 pub struct RecordEntry {
     pub id: String,
     pub entity: Entity,
@@ -206,7 +212,7 @@ impl Journal {
     pub fn latest_clipboard(&self) -> Result<Option<(String, Entity)>, Error> {
         self.connection()?.query_row("SELECT id,revision,body,server_seq,EXISTS(SELECT 1 FROM conflicts WHERE kind='clipboard_item' AND entity_id=entities.id) FROM entities WHERE kind='clipboard_item' AND server_seq>0 ORDER BY server_seq DESC LIMIT 1",[],|row|Ok((row.get(0)?,Entity { revision:row.get(1)?,body:row.get(2)?,server_seq:row.get(3)?,conflicted:row.get(4)? }))).optional().map_err(failed)
     }
-    pub fn enqueue(&self, body: Vec<u8>, expected_cursor: Option<u64>) -> Result<String, Error> {
+    pub fn enqueue(&self, body: Vec<u8>, expected_cursor: Option<u64>) -> Result<Enqueued, Error> {
         if body.len() > 24576 {
             return Err(Error::Invalid);
         }
@@ -243,8 +249,9 @@ impl Journal {
             params![operation.operation_id, kind, operation.entity_id, body],
         )
         .map_err(failed)?;
+        let receipt = tx.query_row("SELECT (SELECT count(*) FROM outbox WHERE state='pending'),(SELECT count(*) FROM conflicts),(SELECT cursor FROM meta WHERE singleton=1)", [], |row| Ok(Enqueued { id: operation.operation_id.clone(), pending: row.get(0)?, conflicts: row.get(1)?, cursor: row.get(2)? })).map_err(failed)?;
         tx.commit().map_err(failed)?;
-        Ok(operation.operation_id)
+        Ok(receipt)
     }
     pub fn state_page(
         &self,
