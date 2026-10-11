@@ -1547,8 +1547,8 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-accounts"
-version = "0.0.1-alpha.13"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git?rev=66795c6dfc074675082b0f80e6d0681693388618#66795c6dfc074675082b0f80e6d0681693388618"
+version = "0.0.1-alpha.14"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git?rev=65ad593d6116a992934d1b06f3874fadfb89c37b#65ad593d6116a992934d1b06f3874fadfb89c37b"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
@@ -1582,8 +1582,8 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-domain"
-version = "0.0.3"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git?rev=e87368c53bd524caeabc1e14743c96fcfd87da77#e87368c53bd524caeabc1e14743c96fcfd87da77"
+version = "0.0.4"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git?rev=3e5b1db049c47799123847c9831f025cb226c69c#3e5b1db049c47799123847c9831f025cb226c69c"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -1594,7 +1594,7 @@ dependencies = [
 [[package]]
 name = "nddev-device-sync-http-signatures"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-protocol.git?rev=9f1698f7042f6f4b4832e7aed70403d0f3ad8218#9f1698f7042f6f4b4832e7aed70403d0f3ad8218"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-protocol.git?rev=65f3032fc5c0f111f8a34f2d697d83181474082f#65f3032fc5c0f111f8a34f2d697d83181474082f"
 dependencies = [
  "base64 0.22.1",
  "httpsig",
