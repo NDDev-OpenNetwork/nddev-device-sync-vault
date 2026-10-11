@@ -31,6 +31,7 @@ pub struct RecordView {
 
 #[derive(Clone)]
 pub struct RecordPage {
+    pub observed_seq: u64,
     pub items: Vec<RecordView>,
     pub next_after: String,
     pub has_more: bool,

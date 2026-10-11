@@ -59,7 +59,7 @@ impl VaultClient {
             expected_key: Mutex::default(),
         })
     }
-    fn admitted(&self) -> Result<OwnedSemaphorePermit, Error> {
+    fn authorized(&self) -> Result<(), Error> {
         let current = scope(&self.identity)?;
         if current.device != self.scope.device
             || current.user != self.scope.user
@@ -67,6 +67,10 @@ impl VaultClient {
         {
             return Err(Error::Locked);
         }
+        Ok(())
+    }
+    fn admitted(&self) -> Result<OwnedSemaphorePermit, Error> {
+        self.authorized()?;
         self.gate
             .clone()
             .try_acquire_owned()
@@ -112,6 +116,12 @@ impl VaultClient {
         })
     }
     pub fn snapshot(&self) -> VaultView {
+        if self.authorized().is_err() {
+            return VaultView {
+                sync_error: Error::Locked.code(),
+                ..VaultView::default()
+            };
+        }
         self.view.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
     async fn update_view(&self) -> Result<VaultView, Error> {
@@ -445,6 +455,7 @@ impl VaultClient {
             }
         }
         Ok(RecordPage {
+            observed_seq,
             items,
             next_after,
             has_more,
@@ -1228,6 +1239,11 @@ mod tests {
         .await;
         store.delete().await.unwrap();
         identity.logout().await.unwrap();
+        assert!(!vault.snapshot().unlocked);
+        assert!(matches!(
+            vault.native_secret("acceptance-record".into()).await,
+            Err(Error::Locked)
+        ));
         std::fs::remove_dir_all(directory).unwrap();
         outcome.unwrap();
     }
