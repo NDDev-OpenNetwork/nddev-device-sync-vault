@@ -76,6 +76,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "apple-native-keyring-store"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -656,6 +662,12 @@ dependencies = [
  "subtle",
  "zeroize",
 ]
+
+[[package]]
+name = "either"
+version = "1.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "elliptic-curve"
@@ -1311,6 +1323,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1547,8 +1568,8 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-accounts"
-version = "0.0.1-alpha.15"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git?rev=e4b9af801d8445214574407863ea86db1d253104#e4b9af801d8445214574407863ea86db1d253104"
+version = "0.0.1-alpha.17"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git?rev=e4f41528fdd668ce32105576546e84d2bea5b05f#e4f41528fdd668ce32105576546e84d2bea5b05f"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
@@ -1582,8 +1603,8 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-domain"
-version = "0.0.5"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git?rev=1f559375dbaa2cebcc746e8b4f122e5f3c7c0a47#1f559375dbaa2cebcc746e8b4f122e5f3c7c0a47"
+version = "0.0.6"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git?rev=d08e6b34c9ff6af1fdc179291f5386ec73c84926#d08e6b34c9ff6af1fdc179291f5386ec73c84926"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -1594,7 +1615,7 @@ dependencies = [
 [[package]]
 name = "nddev-device-sync-http-signatures"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-protocol.git?rev=65f3032fc5c0f111f8a34f2d697d83181474082f#65f3032fc5c0f111f8a34f2d697d83181474082f"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-protocol.git?rev=11d1904cc80e97c8938868bb1a098ee3fded4c6a#11d1904cc80e97c8938868bb1a098ee3fded4c6a"
 dependencies = [
  "base64 0.22.1",
  "httpsig",
@@ -1604,14 +1625,16 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-telemetry"
-version = "0.0.1-alpha.4"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability?rev=e9d9d36227a392a375c3125d7bdc4de01816ff2e#e9d9d36227a392a375c3125d7bdc4de01816ff2e"
+version = "0.0.1-alpha.5"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability?rev=469a77aea2e234b50d0554625a761d52985e7cb0#469a77aea2e234b50d0554625a761d52985e7cb0"
 dependencies = [
  "android_log-sys",
  "chrono",
  "jsonschema",
  "opentelemetry",
+ "opentelemetry-proto",
  "opentelemetry_sdk",
+ "prost",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -1623,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-vault"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -1755,6 +1778,17 @@ dependencies = [
  "js-sys",
  "pin-project-lite",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "opentelemetry-proto"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d576f5dddc3299341bcd85a04be17b2564844c0c9563214f02d85f2524d1afae"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost",
 ]
 
 [[package]]
@@ -1978,6 +2012,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "prost"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

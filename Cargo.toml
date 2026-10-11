@@ -1,6 +1,6 @@
 [package]
 name = "nddev-device-sync-vault"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
@@ -18,8 +18,8 @@ serde_json = "1"
 zeroize = { version = "1.8", features = ["serde"] }
 thiserror = "2"
 uuid = { version = "1.27", features = ["v4"] }
-nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "1f559375dbaa2cebcc746e8b4f122e5f3c7c0a47" }
-nddev-device-sync-accounts = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git", rev = "e4b9af801d8445214574407863ea86db1d253104" }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "d08e6b34c9ff6af1fdc179291f5386ec73c84926" }
+nddev-device-sync-accounts = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git", rev = "e4f41528fdd668ce32105576546e84d2bea5b05f" }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["libsqlite3-sys", "bundled", "fallible_uint"] }
 tokio = { version = "1.53", features = ["rt", "sync", "time"] }
 sha2 = "0.10"

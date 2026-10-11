@@ -11,12 +11,30 @@ pub struct VaultView {
     pub sync_error: String,
 }
 #[derive(Clone)]
+pub struct ConflictView {
+    pub title: String,
+    pub username: String,
+    pub device_id: String,
+    pub deleted: bool,
+}
+#[derive(Clone)]
 pub struct RecordView {
+    pub observed_seq: u64,
+    pub deleted: bool,
     pub id: String,
     pub title: String,
     pub username: String,
     pub revision: u64,
     pub conflicted: bool,
+    pub conflict: Option<ConflictView>,
+}
+
+#[derive(Clone)]
+pub struct RecordPage {
+    pub observed_seq: u64,
+    pub items: Vec<RecordView>,
+    pub next_after: String,
+    pub has_more: bool,
 }
 
 #[derive(Clone)]
