@@ -40,9 +40,21 @@ jobs:
       - run: cargo install --locked --version 0.20.2 cargo-deny
       - run: cargo audit --deny warnings
       - run: cargo deny --locked check licenses sources
+  wasm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '24.21.0'
+      - run: rustup toolchain install 1.99.0 --profile minimal --component clippy --target wasm32-unknown-unknown
+      - run: cargo clippy --locked --lib --target wasm32-unknown-unknown -- -D warnings
   quality:
     if: always()
-    needs: [native, dependencies]
+    needs: [native, dependencies, wasm]
     runs-on: ubuntu-24.04
     steps:
-      - run: test '${{ needs.native.result }}' = success && test '${{ needs.dependencies.result }}' = success
+      - run: test '${{ needs.native.result }}' = success && test '${{ needs.dependencies.result }}' = success && test '${{ needs.wasm.result }}' = success

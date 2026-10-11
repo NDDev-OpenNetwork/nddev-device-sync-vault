@@ -25,6 +25,8 @@ pub struct RecordView {
     pub title: String,
     pub username: String,
     pub revision: u64,
+    /// Local operation identity for optimistic editing; not a server revision.
+    pub pending_id: Option<String>,
     pub conflicted: bool,
     pub conflict: Option<ConflictView>,
 }
@@ -61,7 +63,9 @@ pub struct StatePage {
     pub has_more: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize,
+)]
 pub enum VaultError {
     #[error("vault_invalid_input")]
     Invalid,
@@ -73,6 +77,8 @@ pub enum VaultError {
     Unavailable,
     #[error("vault_busy")]
     Busy,
+    #[error("vault_storage_full")]
+    StorageFull,
     #[error("vault_key_registration_required")]
     RegistrationRequired,
 }
