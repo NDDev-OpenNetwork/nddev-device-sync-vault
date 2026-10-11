@@ -21,6 +21,18 @@ pub struct Entity {
     pub revision: u64,
     pub body: Vec<u8>,
     pub conflicted: bool,
+    pub server_seq: u64,
+}
+pub struct Enqueued {
+    pub id: String,
+    pub pending: u32,
+    pub conflicts: u32,
+    pub cursor: u64,
+}
+pub struct RecordEntry {
+    pub id: String,
+    pub entity: Entity,
+    pub conflict: Option<Vec<u8>>,
 }
 fn failed<E>(_: E) -> Error {
     Error::Unavailable
@@ -52,7 +64,7 @@ impl Journal {
             return Err(Error::Invalid);
         }
         let journal = Self { path };
-        let connection = journal.connection()?;
+        let mut connection = journal.connection()?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),schema_version INTEGER NOT NULL,cursor INTEGER NOT NULL DEFAULT 0 CHECK(cursor BETWEEN 0 AND 9007199254740991));
             INSERT OR IGNORE INTO meta(singleton,schema_version) VALUES(1,1);
             CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,kind TEXT NOT NULL,entity_id TEXT NOT NULL,body BLOB NOT NULL CHECK(length(body)<=24576),state TEXT NOT NULL CHECK(state IN ('pending','conflict')));
@@ -66,7 +78,26 @@ impl Journal {
                 |row| row.get(0),
             )
             .map_err(failed)?;
-        if version != 1 {
+        if version == 1 {
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(failed)?;
+            let current: i64 = tx
+                .query_row(
+                    "SELECT schema_version FROM meta WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(failed)?;
+            // Preserve ciphertext, pending operations and conflicts. Replay the
+            // existing stream to recover committed ordering absent in schema1.
+            if current == 1 {
+                tx.execute_batch("ALTER TABLE entities ADD COLUMN server_seq INTEGER NOT NULL DEFAULT 0 CHECK(server_seq BETWEEN 0 AND 9007199254740991); UPDATE meta SET schema_version=2,cursor=0 WHERE singleton=1;").map_err(failed)?;
+            } else if current != 2 {
+                return Err(Error::Invalid);
+            }
+            tx.commit().map_err(failed)?;
+        } else if version != 2 {
             return Err(Error::Invalid);
         }
         Ok(journal)
@@ -139,27 +170,49 @@ impl Journal {
         self.connection()?.query_row("SELECT (SELECT count(*) FROM outbox WHERE state='pending'),(SELECT count(*) FROM conflicts)",[],|row|Ok((row.get(0)?,row.get(1)?))).map_err(failed)
     }
     pub fn entity(&self, kind: &str, id: &str) -> Result<Option<Entity>, Error> {
-        self.connection()?.query_row("SELECT revision,body,EXISTS(SELECT 1 FROM conflicts WHERE kind=?1 AND entity_id=?2) FROM entities WHERE kind=?1 AND id=?2",params![kind,id],|row|Ok(Entity{revision:row.get(0)?,body:row.get(1)?,conflicted:row.get(2)?})).optional().map_err(failed)
+        self.connection()?.query_row("SELECT revision,body,server_seq,EXISTS(SELECT 1 FROM conflicts WHERE kind=?1 AND entity_id=?2) FROM entities WHERE kind=?1 AND id=?2",params![kind,id],|row|Ok(Entity{revision:row.get(0)?,body:row.get(1)?,server_seq:row.get(2)?,conflicted:row.get(3)?})).optional().map_err(failed)
     }
-    pub fn list(&self, kind: &str) -> Result<Vec<(String, Entity)>, Error> {
-        let connection = self.connection()?;
-        let mut query=connection.prepare("SELECT id,revision,body,EXISTS(SELECT 1 FROM conflicts WHERE kind=?1 AND entity_id=entities.id) FROM entities WHERE kind=?1 ORDER BY id LIMIT 100").map_err(failed)?;
-        query
-            .query_map([kind], |row| {
-                Ok((
-                    row.get(0)?,
-                    Entity {
-                        revision: row.get(1)?,
-                        body: row.get(2)?,
-                        conflicted: row.get(3)?,
-                    },
-                ))
+    pub fn record_page(&self, after: &str) -> Result<(Vec<RecordEntry>, u64), Error> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction().map_err(failed)?;
+        let entries = {
+            let mut query = tx.prepare("SELECT id,revision,body,server_seq,(SELECT body FROM conflicts WHERE kind='vault_record' AND entity_id=entities.id ORDER BY json_extract(CAST(result AS TEXT),'$.server_seq') DESC LIMIT 1) FROM entities WHERE kind='vault_record' AND id>?1 ORDER BY id LIMIT 51").map_err(failed)?;
+            query
+                .query_map([after], |row| {
+                    let conflict: Option<Vec<u8>> = row.get(4)?;
+                    Ok(RecordEntry {
+                        id: row.get(0)?,
+                        entity: Entity {
+                            revision: row.get(1)?,
+                            body: row.get(2)?,
+                            server_seq: row.get(3)?,
+                            conflicted: conflict.is_some(),
+                        },
+                        conflict,
+                    })
+                })
+                .map_err(failed)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(failed)?
+        };
+        let cursor = tx
+            .query_row("SELECT cursor FROM meta WHERE singleton=1", [], |row| {
+                row.get(0)
             })
-            .map_err(failed)?
-            .collect::<Result<_, _>>()
-            .map_err(failed)
+            .map_err(failed)?;
+        tx.commit().map_err(failed)?;
+        Ok((entries, cursor))
     }
-    pub fn enqueue(&self, body: Vec<u8>) -> Result<String, Error> {
+    pub fn record_conflict(&self, id: &str) -> Result<Option<Vec<u8>>, Error> {
+        self.connection()?.query_row("SELECT body FROM conflicts WHERE kind='vault_record' AND entity_id=?1 ORDER BY json_extract(CAST(result AS TEXT),'$.server_seq') DESC LIMIT 1", [id], |row| row.get(0)).optional().map_err(failed)
+    }
+    pub fn has_pending(&self, kind: &str, id: &str) -> Result<bool, Error> {
+        self.connection()?.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE kind=?1 AND entity_id=?2 AND state='pending')",params![kind,id],|row|row.get(0)).map_err(failed)
+    }
+    pub fn latest_clipboard(&self) -> Result<Option<(String, Entity)>, Error> {
+        self.connection()?.query_row("SELECT id,revision,body,server_seq,EXISTS(SELECT 1 FROM conflicts WHERE kind='clipboard_item' AND entity_id=entities.id) FROM entities WHERE kind='clipboard_item' AND server_seq>0 ORDER BY server_seq DESC LIMIT 1",[],|row|Ok((row.get(0)?,Entity { revision:row.get(1)?,body:row.get(2)?,server_seq:row.get(3)?,conflicted:row.get(4)? }))).optional().map_err(failed)
+    }
+    pub fn enqueue(&self, body: Vec<u8>, expected_cursor: Option<u64>) -> Result<Enqueued, Error> {
         if body.len() > 24576 {
             return Err(Error::Invalid);
         }
@@ -171,6 +224,16 @@ impl Journal {
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(failed)?;
+        if let Some(expected) = expected_cursor {
+            let actual: u64 = tx
+                .query_row("SELECT cursor FROM meta WHERE singleton=1", [], |row| {
+                    row.get(0)
+                })
+                .map_err(failed)?;
+            if actual != expected {
+                return Err(Error::Busy);
+            }
+        }
         let count: u64 = tx
             .query_row("SELECT count(*) FROM outbox", [], |row| row.get(0))
             .map_err(failed)?;
@@ -186,8 +249,9 @@ impl Journal {
             params![operation.operation_id, kind, operation.entity_id, body],
         )
         .map_err(failed)?;
+        let receipt = tx.query_row("SELECT (SELECT count(*) FROM outbox WHERE state='pending'),(SELECT count(*) FROM conflicts),(SELECT cursor FROM meta WHERE singleton=1)", [], |row| Ok(Enqueued { id: operation.operation_id.clone(), pending: row.get(0)?, conflicts: row.get(1)?, cursor: row.get(2)? })).map_err(failed)?;
         tx.commit().map_err(failed)?;
-        Ok(operation.operation_id)
+        Ok(receipt)
     }
     pub fn state_page(
         &self,
@@ -195,7 +259,7 @@ impl Journal {
     ) -> Result<Vec<(String, String, Entity)>, Error> {
         let connection = self.connection()?;
         let (kind, id) = after.map_or((None, None), |(kind, id)| (Some(kind), Some(id)));
-        let mut query=connection.prepare("SELECT kind,id,revision,body,EXISTS(SELECT 1 FROM conflicts WHERE kind=entities.kind AND entity_id=entities.id) FROM entities WHERE kind IN ('device_state','module_state','account_state') AND (?1 IS NULL OR (kind,id)>(?1,?2)) ORDER BY kind,id LIMIT 51").map_err(failed)?;
+        let mut query=connection.prepare("SELECT kind,id,revision,body,EXISTS(SELECT 1 FROM conflicts WHERE kind=entities.kind AND entity_id=entities.id),server_seq FROM entities WHERE kind IN ('device_state','module_state','account_state') AND (?1 IS NULL OR (kind,id)>(?1,?2)) ORDER BY kind,id LIMIT 51").map_err(failed)?;
         query
             .query_map(params![kind, id], |row| {
                 Ok((
@@ -205,6 +269,7 @@ impl Journal {
                         revision: row.get(2)?,
                         body: row.get(3)?,
                         conflicted: row.get(4)?,
+                        server_seq: row.get(5)?,
                     },
                 ))
             })
@@ -212,7 +277,7 @@ impl Journal {
             .collect::<Result<_, _>>()
             .map_err(failed)
     }
-    pub fn acknowledge(&self, id: &str, result: &[u8]) -> Result<(), Error> {
+    pub fn acknowledge(&self, id: &str, result: &[u8], resolved: u64) -> Result<(), Error> {
         let outcome: wire::Sync = serde_json::from_slice(result).map_err(|_| Error::Invalid)?;
         let mut connection = self.connection()?;
         let tx = connection
@@ -224,15 +289,18 @@ impl Journal {
             })
             .map_err(failed)?;
         let operation: wire::SyncOperation = serde_json::from_slice(&body).map_err(failed)?;
-        apply(&tx, &operation, &body, &outcome, result)?;
+        apply(&tx, &operation, &body, &outcome, result, resolved)?;
         tx.execute("DELETE FROM outbox WHERE id=?1", [id])
             .map_err(failed)?;
         tx.commit().map_err(failed)
     }
     /// Only advance after every entry is durably applied or retained as an
     /// explicit conflict. A crash replays the same inbox page safely.
-    pub fn ingest(&self, page: &wire::SyncPage) -> Result<(), Error> {
-        if page.entries.len() > 100 || page.next_after_seq < 0 {
+    pub fn ingest(&self, page: &wire::SyncPage, resolutions: &[u64]) -> Result<(), Error> {
+        if page.entries.len() > 100
+            || page.next_after_seq < 0
+            || resolutions.len() != page.entries.len()
+        {
             return Err(Error::Invalid);
         }
         let mut connection = self.connection()?;
@@ -244,7 +312,7 @@ impl Journal {
                 row.get(0)
             })
             .map_err(failed)?;
-        for entry in &page.entries {
+        for (entry, resolved) in page.entries.iter().zip(resolutions) {
             let seq = match &entry.result {
                 wire::Sync::Applied(value) => value.server_seq,
                 wire::Sync::Conflict(value) => value.server_seq,
@@ -254,7 +322,14 @@ impl Journal {
             }
             let body = serde_json::to_vec(&entry.operation).map_err(failed)?;
             let result = serde_json::to_vec(&entry.result).map_err(failed)?;
-            apply(&tx, &entry.operation, &body, &entry.result, &result)?;
+            apply(
+                &tx,
+                &entry.operation,
+                &body,
+                &entry.result,
+                &result,
+                *resolved,
+            )?;
             previous = seq;
         }
         if page.next_after_seq != previous || page.has_more && page.entries.is_empty() {
@@ -280,6 +355,7 @@ fn apply(
     body: &[u8],
     outcome: &wire::Sync,
     result: &[u8],
+    resolved: u64,
 ) -> Result<(), Error> {
     crate::codec::operation(operation, body.len())?;
     let kind = kind(&operation.entity_type);
@@ -288,10 +364,17 @@ fn apply(
             if value.operation_id != operation.operation_id
                 || value.revision != operation.base_revision + 1
                 || value.server_seq < 1
+                || resolved >= value.server_seq as u64
             {
                 return Err(Error::Invalid);
             }
-            tx.execute("INSERT INTO entities(kind,id,revision,body) VALUES(?1,?2,?3,?4) ON CONFLICT(kind,id) DO UPDATE SET revision=EXCLUDED.revision,body=EXCLUDED.body WHERE entities.revision<EXCLUDED.revision",params![kind,operation.entity_id,value.revision,body]).map_err(failed)?;
+            tx.execute("INSERT INTO entities(kind,id,revision,body,server_seq) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(kind,id) DO UPDATE SET revision=EXCLUDED.revision,body=EXCLUDED.body,server_seq=EXCLUDED.server_seq WHERE entities.revision<EXCLUDED.revision OR (entities.revision=EXCLUDED.revision AND entities.body=EXCLUDED.body AND entities.server_seq=0)",params![kind,operation.entity_id,value.revision,body,value.server_seq]).map_err(failed)?;
+            if resolved > 0 {
+                if kind != "vault_record" {
+                    return Err(Error::Invalid);
+                }
+                tx.execute("DELETE FROM conflicts WHERE kind=?1 AND entity_id=?2 AND json_extract(CAST(result AS TEXT),'$.server_seq')<=?3", params![kind,operation.entity_id,resolved]).map_err(failed)?;
+            }
         }
         wire::Sync::Conflict(value) => {
             if value.operation_id != operation.operation_id
@@ -361,11 +444,14 @@ mod tests {
         let key = VaultKey::generate().unwrap();
         let first = encrypted(&key, "operation-1", "record-1");
         let journal = Journal::open(path.clone()).unwrap();
-        journal.enqueue(first.clone()).unwrap();
+        journal.enqueue(first.clone(), None).unwrap();
         drop(journal);
         let journal = Journal::open(path.clone()).unwrap();
         assert_eq!(journal.pending().unwrap()[0].body, first);
-        assert!(matches!(journal.enqueue(first.clone()), Err(Error::Busy)));
+        assert!(matches!(
+            journal.enqueue(first.clone(), None),
+            Err(Error::Busy)
+        ));
         let lock = journal.key_lock().unwrap();
         assert!(matches!(
             Journal::open(path.clone()).unwrap().key_lock(),
@@ -377,6 +463,7 @@ mod tests {
             .acknowledge(
                 "operation-1",
                 &serde_json::to_vec(&result("operation-1", 1)).unwrap(),
+                0,
             )
             .unwrap();
         assert_eq!(journal.cursor().unwrap(), 0);
@@ -389,7 +476,7 @@ mod tests {
             next_after_seq: 1,
             has_more: false,
         };
-        journal.ingest(&page).unwrap();
+        journal.ingest(&page, &vec![0; page.entries.len()]).unwrap();
         assert_eq!(journal.cursor().unwrap(), 1);
         let second = encrypted(&key, "operation-2", "record-2");
         let invalid = wire::SyncPage {
@@ -406,7 +493,10 @@ mod tests {
             next_after_seq: 4,
             has_more: false,
         };
-        assert!(matches!(journal.ingest(&invalid), Err(Error::Invalid)));
+        assert!(matches!(
+            journal.ingest(&invalid, &vec![0; invalid.entries.len()]),
+            Err(Error::Invalid)
+        ));
         assert_eq!(journal.cursor().unwrap(), 1);
         assert!(
             journal

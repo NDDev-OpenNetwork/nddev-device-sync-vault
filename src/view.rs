@@ -11,12 +11,30 @@ pub struct VaultView {
     pub sync_error: String,
 }
 #[derive(Clone)]
+pub struct ConflictView {
+    pub title: String,
+    pub username: String,
+    pub device_id: String,
+    pub deleted: bool,
+}
+#[derive(Clone)]
 pub struct RecordView {
+    pub observed_seq: u64,
+    pub deleted: bool,
     pub id: String,
     pub title: String,
     pub username: String,
     pub revision: u64,
     pub conflicted: bool,
+    pub conflict: Option<ConflictView>,
+}
+
+#[derive(Clone)]
+pub struct RecordPage {
+    pub observed_seq: u64,
+    pub items: Vec<RecordView>,
+    pub next_after: String,
+    pub has_more: bool,
 }
 
 #[derive(Clone)]
@@ -64,4 +82,15 @@ impl VaultError {
     pub fn code(&self) -> String {
         self.to_string()
     }
+}
+
+/// Clipboard metadata only; plaintext is consumed by the native OS adapter.
+#[derive(Clone, Default)]
+pub struct ClipboardView {
+    pub present: bool,
+    pub id: String,
+    pub device_id: String,
+    pub server_seq: u64,
+    pub bytes: u32,
+    pub conflicted: bool,
 }

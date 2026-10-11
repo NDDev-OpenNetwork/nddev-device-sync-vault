@@ -4,11 +4,12 @@ use crate::{
     journal::Journal,
 };
 use nddev_device_sync_accounts::{IdentityClient, SyncRequest, sync_wire as wire};
+use nddev_device_sync_domain::vault::Record;
 use nddev_device_sync_domain::{
     DeviceId,
     sync::{EncryptedPayload, EntityKind, MAX_PLAIN_BYTES, Operation},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     path::PathBuf,
@@ -18,19 +19,13 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
-use crate::view::{RecordView, StatePage, StateView, VaultView};
+use crate::view::{RecordPage, RecordView, StatePage, StateView, VaultView};
 use nddev_device_sync_domain::state::{Reachability, Snapshot, State};
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Record {
-    version: u8,
-    deleted: bool,
-    title: String,
-    username: String,
-    secret: Zeroizing<String>,
+struct Expected {
+    revision: u64,
+    cursor: Option<u64>,
 }
-
 pub struct VaultClient {
     identity: Arc<IdentityClient>,
     scope: Scope,
@@ -64,7 +59,7 @@ impl VaultClient {
             expected_key: Mutex::default(),
         })
     }
-    fn admitted(&self) -> Result<OwnedSemaphorePermit, Error> {
+    fn authorized(&self) -> Result<(), Error> {
         let current = scope(&self.identity)?;
         if current.device != self.scope.device
             || current.user != self.scope.user
@@ -72,6 +67,10 @@ impl VaultClient {
         {
             return Err(Error::Locked);
         }
+        Ok(())
+    }
+    fn admitted(&self) -> Result<OwnedSemaphorePermit, Error> {
+        self.authorized()?;
         self.gate
             .clone()
             .try_acquire_owned()
@@ -117,6 +116,12 @@ impl VaultClient {
         })
     }
     pub fn snapshot(&self) -> VaultView {
+        if self.authorized().is_err() {
+            return VaultView {
+                sync_error: Error::Locked.code(),
+                ..VaultView::default()
+            };
+        }
         self.view.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
     async fn update_view(&self) -> Result<VaultView, Error> {
@@ -238,20 +243,12 @@ impl VaultClient {
         }
         Ok(())
     }
-    pub async fn put(
-        &self,
-        kind: EntityKind,
-        id: String,
-        plaintext: Zeroizing<Vec<u8>>,
-    ) -> Result<String, Error> {
-        let _permit = self.admitted()?;
-        self.put_inner(kind, id, plaintext.as_slice()).await
-    }
     async fn put_inner(
         &self,
         kind: EntityKind,
         id: String,
         plaintext: &[u8],
+        expected: Option<Expected>,
     ) -> Result<String, Error> {
         if plaintext.len() > MAX_PLAIN_BYTES {
             return Err(Error::Invalid);
@@ -261,13 +258,21 @@ impl VaultClient {
         let existing = self
             .local(move |journal| journal.entity(kind.as_str(), &entity_id))
             .await?;
+        let revision = existing.as_ref().map_or(0, |entity| entity.revision);
+        if expected
+            .as_ref()
+            .is_some_and(|expected| expected.revision != revision)
+        {
+            return Err(Error::Busy);
+        }
+        let expected_cursor = expected.as_ref().and_then(|expected| expected.cursor);
         let operation_id = uuid::Uuid::new_v4().to_string();
         let mut operation = Operation {
             id: operation_id.clone(),
             device: DeviceId::new(&self.scope.device).map_err(dependency)?,
             entity_kind: kind,
             entity_id: id,
-            base_revision: existing.map_or(0, |entity| entity.revision),
+            base_revision: revision,
             idempotency_key: operation_id,
             payload: EncryptedPayload {
                 key_id: key.id(),
@@ -277,77 +282,319 @@ impl VaultClient {
         };
         operation.payload = key.encrypt(&self.scope, &operation, plaintext)?;
         let bytes = codec::body(&operation)?;
-        let id = self.local(move |journal| journal.enqueue(bytes)).await?;
-        self.update_view().await?;
+        let receipt = self
+            .local(move |journal| journal.enqueue(bytes, expected_cursor))
+            .await?;
+        // The transaction has committed. No subsequent native-store/SQLite read
+        // may turn this durable success into an apparent failed mutation.
+        let mut view = self.view.lock().unwrap_or_else(|error| error.into_inner());
+        view.unlocked = true;
+        view.key_id = key.id();
+        view.pending = receipt.pending;
+        view.conflicts = receipt.conflicts;
+        view.cursor = receipt.cursor;
+        view.catching_up = true;
+        Ok(receipt.id)
+    }
+    pub async fn share_clipboard(&self, text: Zeroizing<String>) -> Result<String, Error> {
+        let _permit = self.admitted()?;
+        let payload =
+            nddev_device_sync_domain::clipboard::Text::new(text).map_err(|_| Error::Invalid)?;
+        let id = format!("{}:clipboard", self.scope.device);
+        if self
+            .local({
+                let id = id.clone();
+                move |journal| journal.has_pending("clipboard_item", &id)
+            })
+            .await?
+        {
+            return Err(Error::Busy);
+        }
+        let plaintext = Zeroizing::new(serde_json::to_vec(&payload).map_err(dependency)?);
+        if let Some(previous) = self
+            .local({
+                let id = id.clone();
+                move |journal| journal.entity("clipboard_item", &id)
+            })
+            .await?
+        {
+            let wire: wire::SyncOperation =
+                serde_json::from_slice(&previous.body).map_err(dependency)?;
+            let operation = codec::operation(&wire, previous.body.len())?;
+            let key = self.key().await?.ok_or(Error::Locked)?;
+            if key.decrypt(&self.scope, &operation)?.as_slice() == plaintext.as_slice() {
+                return Ok(id);
+            }
+        }
+        self.put_inner(
+            EntityKind::ClipboardItem,
+            id.clone(),
+            plaintext.as_slice(),
+            None,
+        )
+        .await?;
         Ok(id)
+    }
+    /// Resolve only committed server order; a device timestamp never wins.
+    pub async fn clipboard(
+        &self,
+    ) -> Result<Option<(crate::view::ClipboardView, Zeroizing<String>)>, Error> {
+        let _permit = self.admitted()?;
+        if self.snapshot().catching_up || self.snapshot().last_sync_at == 0 {
+            return Err(Error::Busy);
+        }
+        let key = self.key().await?.ok_or(Error::Locked)?;
+        let Some((id, entity)) = self.local(Journal::latest_clipboard).await? else {
+            return Ok(None);
+        };
+        let wire: wire::SyncOperation = serde_json::from_slice(&entity.body).map_err(dependency)?;
+        let operation = codec::operation(&wire, entity.body.len())?;
+        let plaintext = key.decrypt(&self.scope, &operation)?;
+        let value: nddev_device_sync_domain::clipboard::Text =
+            serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
+        value.validate().map_err(|_| Error::Invalid)?;
+        let metadata = crate::view::ClipboardView {
+            present: true,
+            id,
+            device_id: operation.device.as_str().into(),
+            server_seq: entity.server_seq,
+            bytes: value.text.len() as u32,
+            conflicted: entity.conflicted,
+        };
+        if entity.conflicted {
+            return Err(Error::Busy);
+        }
+        Ok(Some((metadata, value.text)))
     }
     pub async fn save_record(
         &self,
         id: Option<String>,
+        expected_revision: u64,
         title: String,
         username: String,
         secret: Zeroizing<String>,
     ) -> Result<String, Error> {
         let _permit = self.admitted()?;
-        if title.trim().is_empty()
-            || title.chars().count() > 128
-            || username.len() > 254
-            || secret.len() > MAX_PLAIN_BYTES
-        {
-            return Err(Error::Invalid);
-        }
         let record = Record {
             version: 1,
             deleted: false,
             title,
             username,
             secret,
+            resolved_through_seq: 0,
         };
+        record.validate().map_err(|_| Error::Invalid)?;
         let plaintext = Zeroizing::new(serde_json::to_vec(&record).map_err(dependency)?);
         let id = id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        self.put_inner(EntityKind::VaultRecord, id, plaintext.as_slice())
-            .await
+        let lookup = id.clone();
+        if self
+            .local(move |journal| journal.entity("vault_record", &lookup))
+            .await?
+            .is_some_and(|entity| entity.conflicted)
+        {
+            return Err(Error::Busy);
+        }
+        self.put_inner(
+            EntityKind::VaultRecord,
+            id,
+            plaintext.as_slice(),
+            Some(Expected {
+                revision: expected_revision,
+                cursor: None,
+            }),
+        )
+        .await
     }
-    pub async fn records(&self) -> Result<Vec<RecordView>, Error> {
+    pub async fn records(&self, after: String) -> Result<RecordPage, Error> {
         let _permit = self.admitted()?;
+        if !after.is_empty() && nddev_device_sync_domain::ModuleId::new(&after).is_err() {
+            return Err(Error::Invalid);
+        }
         let key = self.key().await?.ok_or(Error::Locked)?;
-        let entities = self.local(|journal| journal.list("vault_record")).await?;
-        let mut values = Vec::new();
-        for (id, entity) in entities {
-            let wire: wire::SyncOperation =
-                serde_json::from_slice(&entity.body).map_err(dependency)?;
-            let operation = codec::operation(&wire, entity.body.len())?;
-            let plaintext = key.decrypt(&self.scope, &operation)?;
-            let record: Record = serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
-            if record.version != 1 {
-                return Err(Error::Invalid);
-            }
-            if !record.deleted {
-                values.push(RecordView {
+        let (mut entities, observed_seq) = self
+            .local(move |journal| journal.record_page(&after))
+            .await?;
+        let has_more = entities.len() > 50;
+        entities.truncate(50);
+        let next_after = entities
+            .last()
+            .map(|entry| entry.id.clone())
+            .unwrap_or_default();
+        let mut items = Vec::new();
+        for entry in entities {
+            let crate::journal::RecordEntry {
+                id,
+                entity,
+                conflict,
+            } = entry;
+            let record = self.decode_record(&key, &entity.body)?;
+            let conflict = conflict
+                .map(|body| {
+                    let wire: wire::SyncOperation =
+                        serde_json::from_slice(&body).map_err(|_| Error::Invalid)?;
+                    let record = self.decode_record(&key, &body)?;
+                    Ok(crate::view::ConflictView {
+                        title: record.title,
+                        username: record.username,
+                        device_id: wire.device_id,
+                        deleted: record.deleted,
+                    })
+                })
+                .transpose()?;
+            if !record.deleted || entity.conflicted {
+                items.push(RecordView {
+                    deleted: record.deleted,
+                    observed_seq,
                     id,
                     title: record.title,
                     username: record.username,
                     revision: entity.revision,
                     conflicted: entity.conflicted,
+                    conflict,
                 });
             }
         }
-        Ok(values)
+        Ok(RecordPage {
+            observed_seq,
+            items,
+            next_after,
+            has_more,
+        })
+    }
+    fn decode_record(&self, key: &VaultKey, body: &[u8]) -> Result<Record, Error> {
+        let wire = serde_json::from_slice(body).map_err(|_| Error::Invalid)?;
+        let operation = codec::operation(&wire, body.len())?;
+        let plaintext = key.decrypt(&self.scope, &operation)?;
+        let record: Record = serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
+        record.validate().map_err(|_| Error::Invalid)?;
+        Ok(record)
+    }
+    /// Publish an explicit decision at the observed revision. A competing server
+    /// commit creates another conflict; local conflicts clear only on an applied
+    /// encrypted version 2 record, and every replica observes the same decision.
+    pub async fn resolve_record(
+        &self,
+        id: String,
+        expected_revision: u64,
+        expected_cursor: u64,
+        use_conflict: bool,
+    ) -> Result<String, Error> {
+        nddev_device_sync_domain::ModuleId::new(&id).map_err(|_| Error::Invalid)?;
+        let _permit = self.admitted()?;
+        if self.snapshot().catching_up || self.snapshot().last_sync_at == 0 {
+            return Err(Error::Busy);
+        }
+        let lookup = id.clone();
+        let (entity, conflict, cursor) = self
+            .local(move |journal| {
+                Ok((
+                    journal
+                        .entity("vault_record", &lookup)?
+                        .ok_or(Error::Invalid)?,
+                    journal.record_conflict(&lookup)?,
+                    journal.cursor()?,
+                ))
+            })
+            .await?;
+        if !entity.conflicted || entity.revision != expected_revision || cursor != expected_cursor {
+            return Err(Error::Busy);
+        }
+        let key = self.key().await?.ok_or(Error::Locked)?;
+        let body = if use_conflict {
+            conflict.ok_or(Error::Invalid)?
+        } else {
+            entity.body
+        };
+        let mut record = self.decode_record(&key, &body)?;
+        record.version = 2;
+        record.resolved_through_seq = cursor;
+        record.validate().map_err(|_| Error::Invalid)?;
+        let bytes = Zeroizing::new(serde_json::to_vec(&record).map_err(dependency)?);
+        self.put_inner(
+            EntityKind::VaultRecord,
+            id,
+            &bytes,
+            Some(Expected {
+                revision: expected_revision,
+                cursor: Some(expected_cursor),
+            }),
+        )
+        .await
+    }
+    pub async fn delete_record(&self, id: String, expected_revision: u64) -> Result<String, Error> {
+        nddev_device_sync_domain::ModuleId::new(&id).map_err(|_| Error::Invalid)?;
+        let _permit = self.admitted()?;
+        let lookup = id.clone();
+        let entity = self
+            .local(move |journal| journal.entity("vault_record", &lookup))
+            .await?
+            .ok_or(Error::Invalid)?;
+        if entity.conflicted || entity.revision != expected_revision {
+            return Err(Error::Busy);
+        }
+        let key = self.key().await?.ok_or(Error::Locked)?;
+        let mut record = self.decode_record(&key, &entity.body)?;
+        record.deleted = true;
+        record.secret.clear();
+        record.validate().map_err(|_| Error::Invalid)?;
+        let bytes = Zeroizing::new(serde_json::to_vec(&record).map_err(dependency)?);
+        self.put_inner(
+            EntityKind::VaultRecord,
+            id,
+            &bytes,
+            Some(Expected {
+                revision: expected_revision,
+                cursor: None,
+            }),
+        )
+        .await
+    }
+    fn verify_operation(
+        &self,
+        key: &VaultKey,
+        operation: &wire::SyncOperation,
+    ) -> Result<u64, Error> {
+        let body = serde_json::to_vec(operation).map_err(dependency)?;
+        let operation = codec::operation(operation, body.len())?;
+        let plaintext = key.decrypt(&self.scope, &operation)?;
+        match operation.entity_kind {
+            EntityKind::VaultRecord => {
+                let record: Record =
+                    serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
+                record.validate().map_err(|_| Error::Invalid)?;
+                Ok(record.resolved_through_seq)
+            }
+            EntityKind::ClipboardItem => {
+                let text: nddev_device_sync_domain::clipboard::Text =
+                    serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
+                text.validate().map_err(|_| Error::Invalid)?;
+                Ok(0)
+            }
+            kind => {
+                let snapshot: Snapshot =
+                    serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
+                snapshot
+                    .validate(&operation.device, kind, &operation.entity_id)
+                    .map_err(|_| Error::Invalid)?;
+                Ok(0)
+            }
+        }
     }
     /// Native use only. The presentation wrapper delegates to native clipboard
     /// or declared provider adapters; it never returns this value through FFI.
     pub async fn native_secret(&self, id: String) -> Result<Zeroizing<String>, Error> {
+        nddev_device_sync_domain::ModuleId::new(&id).map_err(|_| Error::Invalid)?;
         let _permit = self.admitted()?;
         let key = self.key().await?.ok_or(Error::Locked)?;
         let entity = self
             .local(move |journal| journal.entity("vault_record", &id))
             .await?
             .ok_or(Error::Invalid)?;
-        let wire: wire::SyncOperation = serde_json::from_slice(&entity.body).map_err(dependency)?;
-        let operation = codec::operation(&wire, entity.body.len())?;
-        let plaintext = key.decrypt(&self.scope, &operation)?;
-        let record: Record = serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
-        if record.deleted || record.version != 1 {
+        if entity.conflicted {
+            return Err(Error::Busy);
+        }
+        let record = self.decode_record(&key, &entity.body)?;
+        if record.deleted {
             return Err(Error::Invalid);
         }
         Ok(record.secret)
@@ -428,7 +675,7 @@ impl VaultClient {
                 prepared.push((kind, id, bytes));
             }
             for (kind, id, bytes) in prepared {
-                self.put_inner(kind, id, bytes.as_slice()).await?;
+                self.put_inner(kind, id, bytes.as_slice(), None).await?;
             }
             self.synchronize_inner().await
         })
@@ -561,7 +808,11 @@ impl VaultClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .catching_up = true;
+        let key = self.key().await?.ok_or(Error::Locked)?;
         for pending in self.local(Journal::pending).await? {
+            let operation: wire::SyncOperation =
+                serde_json::from_slice(&pending.body).map_err(|_| Error::Invalid)?;
+            let resolved = self.verify_operation(&key, &operation)?;
             let result = self
                 .identity
                 .sync_request(SyncRequest::Append(pending.body))
@@ -570,7 +821,7 @@ impl VaultClient {
             if !matches!(result.status, 201 | 409) {
                 return Err(Error::Invalid);
             }
-            self.local(move |journal| journal.acknowledge(&pending.id, &result.body))
+            self.local(move |journal| journal.acknowledge(&pending.id, &result.body, resolved))
                 .await?;
         }
         let mut more = true;
@@ -587,7 +838,13 @@ impl VaultClient {
             let page: wire::SyncPage =
                 serde_json::from_slice(&result.body).map_err(|_| Error::Invalid)?;
             more = page.has_more;
-            self.local(move |journal| journal.ingest(&page)).await?;
+            let resolutions = page
+                .entries
+                .iter()
+                .map(|entry| self.verify_operation(&key, &entry.operation))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.local(move |journal| journal.ingest(&page, &resolutions))
+                .await?;
             if !more {
                 break;
             }
@@ -684,8 +941,26 @@ mod tests {
         );
         let identity = Arc::new(IdentityClient::new(endpoint).unwrap());
         identity.refresh().await.unwrap();
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let previous: serde_json::Value = http
+            .get(format!("{mailbox}/api/v1/messages"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let previous_ids: Vec<String> = previous["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["ID"].as_str().map(str::to_owned))
+            .collect();
         identity.request_email(owner.into(), "en").await.unwrap();
-        let http = reqwest::Client::builder().no_proxy().build().unwrap();
         let code = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let messages: serde_json::Value = http
@@ -700,6 +975,7 @@ mod tests {
                     .as_array()
                     .and_then(|values| values.first())
                     .and_then(|value| value["ID"].as_str())
+                    .filter(|id| !previous_ids.iter().any(|previous| previous == id))
                 {
                     let message: serde_json::Value = http
                         .get(format!("{mailbox}/api/v1/message/{id}"))
@@ -739,6 +1015,7 @@ mod tests {
             vault
                 .save_record(
                     Some("acceptance-record".into()),
+                    0,
                     "Acceptance record".into(),
                     "test-user".into(),
                     Zeroizing::new(secret.into()),
@@ -748,7 +1025,7 @@ mod tests {
             let view = vault.synchronize().await?;
             assert_eq!(view.pending, 0);
             assert_eq!(view.cursor, 1);
-            let records = vault.records().await?;
+            let records = vault.records(String::new()).await?.items;
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].title, "Acceptance record");
             let identity_view = identity.view();
@@ -835,6 +1112,7 @@ mod tests {
                 vault
                     .save_record(
                         Some(format!("catchup-{index}")),
+                        0,
                         format!("Record {index}"),
                         String::new(),
                         Zeroizing::new(uuid::Uuid::new_v4().to_string()),
@@ -854,7 +1132,98 @@ mod tests {
             assert_eq!(partial.last_sync_at, 0);
             let complete = fresh.synchronize().await?;
             assert!(!complete.catching_up && complete.cursor == 36 && complete.last_sync_at > 0);
-            assert_eq!(fresh.records().await?.len(), 34);
+            assert_eq!(fresh.records(String::new()).await?.items.len(), 34);
+            let clipboard_text="Actual encrypted shared clipboard: проверка";
+            vault.share_clipboard(Zeroizing::new(clipboard_text.into())).await?;
+            let mut synced=vault.synchronize().await?;
+            while synced.catching_up {synced=vault.synchronize().await?;}
+            fresh.synchronize().await?;
+            let (received,plain)=fresh.clipboard().await?.unwrap();
+            assert_eq!(plain.as_str(),clipboard_text);
+            assert_eq!(received.server_seq,37);
+            assert_eq!(received.device_id,current.device_id);
+            let cursor=vault.snapshot().cursor;
+            vault.share_clipboard(Zeroizing::new(clipboard_text.into())).await?;
+            assert_eq!(vault.synchronize().await?.cursor,cursor);
+            fresh.share_clipboard(Zeroizing::new("A later committed clipboard item".into())).await?;
+            fresh.synchronize().await?;vault.synchronize().await?;
+            let (newer,plain)=vault.clipboard().await?.unwrap();
+            assert_eq!(newer.server_seq,38);assert_eq!(plain.as_str(),"A later committed clipboard item");
+            // Real schema1 migration preserves ciphertext and receipts. Replaying
+            // recovers committed sequence without resetting any native key.
+            let path=vault.journal.path_for_acceptance();
+            let sqlite=rusqlite::Connection::open(&path).map_err(dependency)?;
+            sqlite.execute_batch("ALTER TABLE entities DROP COLUMN server_seq; UPDATE meta SET schema_version=1;").map_err(dependency)?;drop(sqlite);
+            let migrated=VaultClient::new(identity.clone(),directory.clone()).await?;
+            assert!(matches!(migrated.clipboard().await,Err(Error::Busy)));
+            let mut progress=migrated.synchronize().await?;while progress.catching_up{progress=migrated.synchronize().await?;}
+            assert_eq!(migrated.native_secret("acceptance-record".into()).await?.as_str(),secret);
+            assert_eq!(migrated.clipboard().await?.unwrap().0.server_seq,38);
+            // Two independent durable replicas retain competing edits. Both
+            // deny native use until a revision/cursor-bound owner decision lands.
+            vault.save_record(Some("acceptance-record".into()), 1, "Server edit".into(), "test-user".into(), Zeroizing::new(secret.into())).await?;
+            fresh.save_record(Some("acceptance-record".into()), 1, "Competing edit".into(), "test-user".into(), Zeroizing::new("PRIVATE_COMPETING_VALUE".into())).await?;
+            vault.synchronize().await?; fresh.synchronize().await?; vault.synchronize().await?;
+            assert!(matches!(vault.native_secret("acceptance-record".into()).await, Err(Error::Busy)));
+            assert!(matches!(fresh.native_secret("acceptance-record".into()).await, Err(Error::Busy)));
+            let record = fresh.records(String::new()).await?.items.into_iter().find(|record| record.id == "acceptance-record").unwrap();
+            assert!(record.conflicted && record.conflict.as_ref().unwrap().title == "Competing edit");
+            assert!(matches!(fresh.resolve_record(record.id.clone(), record.revision - 1, record.observed_seq, false).await, Err(Error::Busy)));
+            assert!(matches!(fresh.resolve_record(record.id.clone(), record.revision, record.observed_seq - 1, false).await, Err(Error::Busy)));
+            fresh.resolve_record(record.id, record.revision, record.observed_seq, false).await?;
+            fresh.synchronize().await?; vault.synchronize().await?;
+            assert_eq!(vault.snapshot().conflicts, 0); assert_eq!(fresh.snapshot().conflicts, 0);
+            assert_eq!(vault.native_secret("acceptance-record".into()).await?.as_str(), secret);
+            for index in 0..120 {
+                vault.save_record(Some(format!("bulk-{index:03}")), 0, format!("Page record {index}"), String::new(), Zeroizing::new("PRIVATE_PAGE_VALUE".into())).await?;
+            }
+            for _ in 0..16 { if !vault.synchronize().await?.catching_up { break; } }
+            assert!(!vault.snapshot().catching_up);
+            for _ in 0..16 { if !fresh.synchronize().await?.catching_up { break; } }
+            assert!(!fresh.snapshot().catching_up);
+            // A stale edit of a deleted record must remain visible as a
+            // resolvable conflict. Choosing it restores only that chosen value.
+            vault.delete_record("bulk-000".into(), 1).await?;
+            fresh.save_record(Some("bulk-000".into()), 1, "Restore chosen edit".into(), String::new(), Zeroizing::new("PRIVATE_RESTORED_VALUE".into())).await?;
+            vault.synchronize().await?; fresh.synchronize().await?;
+            let record = fresh.records(String::new()).await?.items.into_iter().find(|record| record.id == "bulk-000").unwrap();
+            assert!(record.deleted && record.conflicted);
+            fresh.resolve_record(record.id, record.revision, record.observed_seq, true).await?;
+            fresh.synchronize().await?; vault.synchronize().await?;
+            assert_eq!(vault.native_secret("bulk-000".into()).await?.as_str(), "PRIVATE_RESTORED_VALUE");
+            for index in 1..=5 { vault.delete_record(format!("bulk-{index:03}"), 1).await?; }
+            vault.synchronize().await?;
+            let mut after = String::new(); let mut ids = std::collections::BTreeSet::new();
+            for _ in 0..8 {
+                let page = vault.records(after.clone()).await?;
+                assert!(page.items.len() <= 50);
+                for record in page.items { assert!(ids.insert(record.id)); }
+                if !page.has_more { break; }
+                assert!(page.next_after > after); after = page.next_after;
+            }
+            assert_eq!(ids.len(), 149);
+            assert!(ids.contains("bulk-119") && ids.contains("catchup-9"));
+            // An authenticated but corrupt server record must not advance the
+            // verified inbox cursor or freshness. This poisons only this owned
+            // disposable server; production has no reset/repair bypass.
+            let cursor = vault.journal.cursor()?;
+            fresh.save_record(Some("before-invalid".into()), 0, "Valid preceding record".into(), String::new(), Zeroizing::new("PRIVATE_VALID_PREFIX".into())).await?;
+            for _ in 0..16 { if !fresh.synchronize().await?.catching_up { break; } }
+            assert!(!fresh.snapshot().catching_up);
+            let native_key = vault.key().await?.unwrap();
+            let mut invalid = Operation { id: uuid::Uuid::new_v4().to_string(), device: DeviceId::new(&vault.scope.device).unwrap(), entity_kind: EntityKind::VaultRecord, entity_id: "invalid-authentication".into(), base_revision: 0, idempotency_key: uuid::Uuid::new_v4().to_string(), payload: EncryptedPayload { key_id: native_key.id(), nonce: [0; 12], ciphertext: Vec::new() } };
+            let plaintext = Zeroizing::new(serde_json::to_vec(&Record { version: 1, deleted: false, title: "Invalid fixture record".into(), username: String::new(), secret: Zeroizing::new("PRIVATE_TAMPER_VALUE".into()), resolved_through_seq: 0 }).unwrap());
+            invalid.payload = native_key.encrypt(&vault.scope, &invalid, &plaintext)?;
+            invalid.payload.ciphertext[0] ^= 1;
+            let accepted = identity.sync_request(SyncRequest::Append(codec::body(&invalid)?)).await.map_err(dependency)?;
+            assert_eq!(accepted.status, 201);
+            let freshness = vault.snapshot().last_sync_at;
+            assert!(matches!(vault.synchronize().await, Err(Error::Authentication)));
+            assert_eq!(vault.journal.cursor()?, cursor);
+            assert_eq!(vault.snapshot().last_sync_at, freshness);
+            assert!(vault.journal.entity("vault_record", "invalid-authentication")?.is_none());
+            assert!(vault.journal.entity("vault_record", "before-invalid")?.is_none());
+            assert_eq!(store.read().await.map_err(dependency)?.unwrap().as_slice(), key.as_slice());
             // Actual persisted SQLite bytes contain ciphertext, not native keys
             // or the record's plaintext. Native credentials use a separate store.
             let path = vault.journal.path_for_acceptance();
@@ -870,6 +1239,11 @@ mod tests {
         .await;
         store.delete().await.unwrap();
         identity.logout().await.unwrap();
+        assert!(!vault.snapshot().unlocked);
+        assert!(matches!(
+            vault.native_secret("acceptance-record".into()).await,
+            Err(Error::Locked)
+        ));
         std::fs::remove_dir_all(directory).unwrap();
         outcome.unwrap();
     }
