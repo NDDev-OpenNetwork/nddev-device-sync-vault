@@ -1,4 +1,4 @@
-//! Native E2EE adapters. No plaintext or decryption key is sent to the server.
+//! Native encrypted replica and server-managed key provisioning adapters.
 mod client;
 mod codec;
 pub use client::VaultClient;
