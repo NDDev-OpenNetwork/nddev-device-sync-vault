@@ -281,6 +281,71 @@ impl VaultClient {
         self.update_view().await?;
         Ok(id)
     }
+    pub async fn share_clipboard(&self, text: Zeroizing<String>) -> Result<String, Error> {
+        let _permit = self.admitted()?;
+        let payload =
+            nddev_device_sync_domain::clipboard::Text::new(text).map_err(|_| Error::Invalid)?;
+        let id = format!("{}:clipboard", self.scope.device);
+        if self
+            .local({
+                let id = id.clone();
+                move |journal| journal.has_pending("clipboard_item", &id)
+            })
+            .await?
+        {
+            return Err(Error::Busy);
+        }
+        let plaintext = Zeroizing::new(serde_json::to_vec(&payload).map_err(dependency)?);
+        if let Some(previous) = self
+            .local({
+                let id = id.clone();
+                move |journal| journal.entity("clipboard_item", &id)
+            })
+            .await?
+        {
+            let wire: wire::SyncOperation =
+                serde_json::from_slice(&previous.body).map_err(dependency)?;
+            let operation = codec::operation(&wire, previous.body.len())?;
+            let key = self.key().await?.ok_or(Error::Locked)?;
+            if key.decrypt(&self.scope, &operation)?.as_slice() == plaintext.as_slice() {
+                return Ok(id);
+            }
+        }
+        self.put_inner(EntityKind::ClipboardItem, id.clone(), plaintext.as_slice())
+            .await?;
+        Ok(id)
+    }
+    /// Resolve only committed server order; a device timestamp never wins.
+    pub async fn clipboard(
+        &self,
+    ) -> Result<Option<(crate::view::ClipboardView, Zeroizing<String>)>, Error> {
+        let _permit = self.admitted()?;
+        if self.snapshot().catching_up || self.snapshot().last_sync_at == 0 {
+            return Err(Error::Busy);
+        }
+        let key = self.key().await?.ok_or(Error::Locked)?;
+        let Some((id, entity)) = self.local(Journal::latest_clipboard).await? else {
+            return Ok(None);
+        };
+        let wire: wire::SyncOperation = serde_json::from_slice(&entity.body).map_err(dependency)?;
+        let operation = codec::operation(&wire, entity.body.len())?;
+        let plaintext = key.decrypt(&self.scope, &operation)?;
+        let value: nddev_device_sync_domain::clipboard::Text =
+            serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
+        value.validate().map_err(|_| Error::Invalid)?;
+        let metadata = crate::view::ClipboardView {
+            present: true,
+            id,
+            device_id: operation.device.as_str().into(),
+            server_seq: entity.server_seq,
+            bytes: value.text.len() as u32,
+            conflicted: entity.conflicted,
+        };
+        if entity.conflicted {
+            return Err(Error::Busy);
+        }
+        Ok(Some((metadata, value.text)))
+    }
     pub async fn save_record(
         &self,
         id: Option<String>,
@@ -858,6 +923,32 @@ mod tests {
             let complete = fresh.synchronize().await?;
             assert!(!complete.catching_up && complete.cursor == 36 && complete.last_sync_at > 0);
             assert_eq!(fresh.records().await?.len(), 34);
+            let clipboard_text="Actual encrypted shared clipboard: проверка";
+            vault.share_clipboard(Zeroizing::new(clipboard_text.into())).await?;
+            let mut synced=vault.synchronize().await?;
+            while synced.catching_up {synced=vault.synchronize().await?;}
+            fresh.synchronize().await?;
+            let (received,plain)=fresh.clipboard().await?.unwrap();
+            assert_eq!(plain.as_str(),clipboard_text);
+            assert_eq!(received.server_seq,37);
+            assert_eq!(received.device_id,current.device_id);
+            let cursor=vault.snapshot().cursor;
+            vault.share_clipboard(Zeroizing::new(clipboard_text.into())).await?;
+            assert_eq!(vault.synchronize().await?.cursor,cursor);
+            fresh.share_clipboard(Zeroizing::new("A later committed clipboard item".into())).await?;
+            fresh.synchronize().await?;vault.synchronize().await?;
+            let (newer,plain)=vault.clipboard().await?.unwrap();
+            assert_eq!(newer.server_seq,38);assert_eq!(plain.as_str(),"A later committed clipboard item");
+            // Real schema1 migration preserves ciphertext and receipts. Replaying
+            // recovers committed sequence without resetting any native key.
+            let path=vault.journal.path_for_acceptance();
+            let sqlite=rusqlite::Connection::open(&path).map_err(dependency)?;
+            sqlite.execute_batch("ALTER TABLE entities DROP COLUMN server_seq; UPDATE meta SET schema_version=1;").map_err(dependency)?;drop(sqlite);
+            let migrated=VaultClient::new(identity.clone(),directory.clone()).await?;
+            assert!(matches!(migrated.clipboard().await,Err(Error::Busy)));
+            let mut progress=migrated.synchronize().await?;while progress.catching_up{progress=migrated.synchronize().await?;}
+            assert_eq!(migrated.native_secret("acceptance-record".into()).await?.as_str(),secret);
+            assert_eq!(migrated.clipboard().await?.unwrap().0.server_seq,38);
             // Actual persisted SQLite bytes contain ciphertext, not native keys
             // or the record's plaintext. Native credentials use a separate store.
             let path = vault.journal.path_for_acceptance();

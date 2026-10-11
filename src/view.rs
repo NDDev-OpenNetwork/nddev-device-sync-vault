@@ -65,3 +65,14 @@ impl VaultError {
         self.to_string()
     }
 }
+
+/// Clipboard metadata only; plaintext is consumed by the native OS adapter.
+#[derive(Clone, Default)]
+pub struct ClipboardView {
+    pub present: bool,
+    pub id: String,
+    pub device_id: String,
+    pub server_seq: u64,
+    pub bytes: u32,
+    pub conflicted: bool,
+}

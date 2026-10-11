@@ -1547,8 +1547,8 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-accounts"
-version = "0.0.1-alpha.14"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git?rev=65ad593d6116a992934d1b06f3874fadfb89c37b#65ad593d6116a992934d1b06f3874fadfb89c37b"
+version = "0.0.1-alpha.15"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git?rev=aa826d2e9264e94739020fa4c7fcb5e2f6400391#aa826d2e9264e94739020fa4c7fcb5e2f6400391"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
@@ -1582,8 +1582,8 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-domain"
-version = "0.0.4"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git?rev=3e5b1db049c47799123847c9831f025cb226c69c#3e5b1db049c47799123847c9831f025cb226c69c"
+version = "0.0.5"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git?rev=68796bbd0108ea99f1deca5a4b8d30c80b7e5c82#68796bbd0108ea99f1deca5a4b8d30c80b7e5c82"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -1604,8 +1604,8 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-telemetry"
-version = "0.0.1-alpha.3"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability?rev=863a0caad5a06a450a0d99a23675bfb5b5959b2e#863a0caad5a06a450a0d99a23675bfb5b5959b2e"
+version = "0.0.1-alpha.4"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability?rev=e9d9d36227a392a375c3125d7bdc4de01816ff2e#e9d9d36227a392a375c3125d7bdc4de01816ff2e"
 dependencies = [
  "android_log-sys",
  "chrono",
@@ -1623,7 +1623,7 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-vault"
-version = "0.0.1-alpha.2"
+version = "0.0.1-alpha.3"
 dependencies = [
  "base64 0.22.1",
  "libc",
