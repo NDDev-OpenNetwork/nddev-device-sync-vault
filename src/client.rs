@@ -343,6 +343,9 @@ impl VaultClient {
             .local(move |journal| journal.entity("vault_record", &id))
             .await?
             .ok_or(Error::Invalid)?;
+        if entity.conflicted {
+            return Err(Error::Busy);
+        }
         let wire: wire::SyncOperation = serde_json::from_slice(&entity.body).map_err(dependency)?;
         let operation = codec::operation(&wire, entity.body.len())?;
         let plaintext = key.decrypt(&self.scope, &operation)?;
