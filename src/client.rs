@@ -31,11 +31,20 @@ pub struct VaultClient {
     scope: Scope,
     journal: Storage,
     gate: Arc<Semaphore>,
+    sync_gate: Arc<Semaphore>,
     view: Mutex<VaultView>,
     expected_key: Mutex<Option<String>>,
 }
 fn dependency<E>(_: E) -> Error {
     Error::Unavailable
+}
+fn identity_failure(error: nddev_device_sync_accounts::ClientError) -> Error {
+    use nddev_device_sync_accounts::ClientError;
+    match error {
+        ClientError::Busy => Error::Busy,
+        ClientError::DeviceRevoked | ClientError::RevalidationRequired => Error::Locked,
+        _ => Error::Unavailable,
+    }
 }
 impl VaultClient {
     pub async fn new(identity: Arc<IdentityClient>, data_dir: PathBuf) -> Result<Self, Error> {
@@ -50,6 +59,7 @@ impl VaultClient {
             scope,
             journal,
             gate: Arc::new(Semaphore::new(1)),
+            sync_gate: Arc::new(Semaphore::new(1)),
             view: Mutex::default(),
             expected_key: Mutex::default(),
         };
@@ -78,12 +88,15 @@ impl VaultClient {
             .map_err(|_| Error::Busy)
     }
     async fn key(&self) -> Result<Option<VaultKey>, Error> {
-        if self.identity.authorize_local().await.is_err() {
-            let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
-            view.unlocked = false;
-            view.key_id.clear();
-            view.sync_error = Error::Locked.code();
-            return Err(Error::Locked);
+        if let Err(error) = self.identity.authorize_local().await {
+            let error = identity_failure(error);
+            if error == Error::Locked {
+                let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+                view.unlocked = false;
+                view.key_id.clear();
+                view.sync_error = error.code();
+            }
+            return Err(error);
         }
         let secret = self
             .identity
@@ -120,12 +133,16 @@ impl VaultClient {
         let (pending, conflicts, cursor, last_sync_at, local_revision) =
             self.journal.stats().await?;
         let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        if local_revision < view.local_revision {
+            return Ok(view.clone());
+        }
         view.unlocked = key.is_some();
         view.key_id = key.as_ref().map(VaultKey::id).unwrap_or_default();
         view.pending = pending;
         view.conflicts = conflicts;
         view.cursor = cursor;
         view.local_revision = local_revision;
+        view.catching_up |= pending > 0;
         view.last_sync_at = last_sync_at;
         Ok(view.clone())
     }
@@ -140,7 +157,7 @@ impl VaultClient {
     }
     async fn ensure_key(&self) -> Result<(), Error> {
         if !self.identity.view().session_verified {
-            let view = self.identity.refresh().await.map_err(dependency)?;
+            let view = self.identity.refresh().await.map_err(identity_failure)?;
             if !view.authenticated {
                 return Err(Error::Locked);
             }
@@ -198,7 +215,7 @@ impl VaultClient {
             .identity
             .sync_request(SyncRequest::Page { after: 0, limit: 1 })
             .await
-            .map_err(dependency)?;
+            .map_err(identity_failure)?;
         let page: wire::SyncPage =
             serde_json::from_slice(&reply.body).map_err(|_| Error::Invalid)?;
         let expected = if let Some(entry) = page.entries.first() {
@@ -297,13 +314,15 @@ impl VaultClient {
         // The transaction has committed. No subsequent native-store/SQLite read
         // may turn this durable success into an apparent failed mutation.
         let mut view = self.view.lock().unwrap_or_else(|error| error.into_inner());
-        view.unlocked = true;
-        view.key_id = key.id();
-        view.pending = receipt.pending;
-        view.conflicts = receipt.conflicts;
-        view.cursor = receipt.cursor;
-        view.local_revision = receipt.local_revision;
-        view.catching_up = true;
+        if receipt.local_revision >= view.local_revision {
+            view.unlocked = true;
+            view.key_id = key.id();
+            view.pending = receipt.pending;
+            view.conflicts = receipt.conflicts;
+            view.cursor = receipt.cursor;
+            view.local_revision = receipt.local_revision;
+            view.catching_up = true;
+        }
         Ok(receipt.id)
     }
     pub async fn share_clipboard(&self, text: Zeroizing<String>) -> Result<String, Error> {
@@ -605,7 +624,12 @@ impl VaultClient {
         Ok(record.secret)
     }
     pub async fn synchronize(&self) -> Result<VaultView, Error> {
-        let _permit = self.admitted()?;
+        self.authorized()?;
+        let _permit = self
+            .sync_gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Busy)?;
         self.view
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -632,7 +656,12 @@ impl VaultClient {
     /// Native callers provide actual observations, never presentation-authored
     /// DTOs. A bounded batch is encrypted/durable before network acknowledgement.
     pub async fn publish_states(&self, snapshots: Vec<Snapshot>) -> Result<VaultView, Error> {
-        let _permit = self.admitted()?;
+        self.authorized()?;
+        let _permit = self
+            .sync_gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Busy)?;
         nddev_device_sync_accounts::runtime::timeout(std::time::Duration::from_secs(60), async {
             if snapshots.is_empty() || snapshots.len() > 32 {
                 return Err(Error::Invalid);
@@ -821,7 +850,7 @@ impl VaultClient {
                 .identity
                 .sync_request(SyncRequest::Append(pending.body))
                 .await
-                .map_err(dependency)?;
+                .map_err(identity_failure)?;
             if !matches!(result.status, 201 | 409) {
                 return Err(Error::Invalid);
             }
@@ -840,7 +869,7 @@ impl VaultClient {
                     limit: 2,
                 })
                 .await
-                .map_err(dependency)?;
+                .map_err(identity_failure)?;
             let page: wire::SyncPage =
                 serde_json::from_slice(&result.body).map_err(|_| Error::Invalid)?;
             more = page.has_more;
@@ -910,10 +939,7 @@ fn key_registry(secret: &[u8]) -> Result<Vec<VaultKey>, Error> {
 
 fn scope(identity: &IdentityClient) -> Result<Scope, Error> {
     let view = identity.view();
-    if !view.authenticated
-        || !(view.session_verified || view.offline_authorized)
-        || view.credential_revalidation_required
-    {
+    if !view.authenticated || view.credential_revalidation_required {
         return Err(Error::Locked);
     }
     let device = view
@@ -932,6 +958,111 @@ fn scope(identity: &IdentityClient) -> Result<Scope, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn fixture_mode(receipt: &serde_json::Value, mode: &str) -> Result<(), Error> {
+        let path = std::env::var("NDS_FIXTURE_RECEIPT").map_err(dependency)?;
+        let control = receipt["control_file"].as_str().ok_or(Error::Invalid)?;
+        std::fs::write(
+            control,
+            serde_json::to_vec(&serde_json::json!({"mode":mode})).map_err(dependency)?,
+        )
+        .map_err(dependency)?;
+        tokio::time::timeout(std::time::Duration::from_secs(12), async {
+            loop {
+                let state: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).map_err(dependency)?)
+                        .map_err(dependency)?;
+                if state["status"] == if mode == "online" { "running" } else { mode } {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(dependency)?
+    }
+    async fn concurrent_offline_write(
+        identity: Arc<IdentityClient>,
+        directory: PathBuf,
+        receipt: &serde_json::Value,
+    ) -> Result<(), Error> {
+        let probe = Arc::new(VaultClient::new(identity.clone(), directory.clone()).await?);
+        fixture_mode(receipt, "offline").await?;
+        let result = async {
+            let address = receipt["base_url"]
+                .as_str()
+                .ok_or(Error::Invalid)?
+                .strip_prefix("http://")
+                .ok_or(Error::Invalid)?;
+            let listener = std::net::TcpListener::bind(address).map_err(dependency)?;
+            listener.set_nonblocking(true).map_err(dependency)?;
+            let (connected, accepted) = tokio::sync::oneshot::channel();
+            let (release, hold) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let connection = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(5))
+                        }
+                        Err(_) => return Err(Error::Unavailable),
+                    }
+                };
+                let _ = connected.send(());
+                let _ = hold.recv_timeout(std::time::Duration::from_secs(10));
+                drop(connection);
+                Ok(())
+            });
+            // Match the production coordinator's task boundary. The long
+            // acceptance future must not nest the HTTP poll stack inside its
+            // unrelated local-edit future on the test runner's thread.
+            let background = probe.clone();
+            let mut synchronization = tokio::spawn(async move { background.synchronize().await });
+            let outcome = async {
+                tokio::select! {
+                    _=&mut synchronization=>return Err(Error::Invalid),
+                    result=accepted=>result.map_err(dependency)?,
+                }
+                // The genuine network request remains unanswered, but local
+                // encryption/commit and read-your-writes have their own gate.
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    probe.save_record(
+                        Some("concurrent-offline".into()),
+                        0,
+                        None,
+                        "Offline during stalled sync".into(),
+                        String::new(),
+                        Zeroizing::new("PRIVATE_OFFLINE_CONCURRENT_VALUE".into()),
+                    ),
+                )
+                .await
+                .map_err(dependency)??;
+                let reopened = VaultClient::new(identity, directory).await?;
+                let page = reopened.records(String::new()).await?;
+                if page.items.len() != 1
+                    || page.items[0].title != "Offline during stalled sync"
+                    || page.items[0].pending_id.is_none()
+                {
+                    return Err(Error::Invalid);
+                }
+                Ok(())
+            }
+            .await;
+            synchronization.abort();
+            let _ = synchronization.await;
+            let _ = release.send(());
+            worker.join().map_err(dependency)??;
+            outcome
+        }
+        .await;
+        fixture_mode(receipt, "online").await?;
+        result
+    }
     #[tokio::test]
     #[ignore = "requires an owned PostgreSQL/Mailpit fixture and actual native credentials"]
     async fn actual_native_vault_outbox_backend_and_process_recreation() {
@@ -1021,6 +1152,7 @@ mod tests {
         let outcome = async {
             let created = vault.refresh().await?;
             assert!(created.unlocked && created.cursor == 0);
+            Box::pin(concurrent_offline_write(identity.clone(),directory.join("concurrent-probe"),&receipt)).await?;
             let key = store.read().await.map_err(dependency)?.unwrap();
             let secret = "PRIVATE_ACTUAL_VAULT_VALUE";
             vault
@@ -1130,7 +1262,7 @@ mod tests {
                     )
                     .await?;
             }
-            let old_sync = vault.snapshot().last_sync_at;
+            let old_sync = vault.refresh_local().await?.last_sync_at;
             for _ in 0..2 {
                 let partial = vault.synchronize().await?;
                 assert!(partial.catching_up && partial.pending > 0);
