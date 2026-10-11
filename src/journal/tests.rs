@@ -169,6 +169,7 @@ fn offline_edits_coalesce_but_claimed_bytes_and_successor_order_survive_restart(
     let (owned, journal, key) = owned_journal();
     let first = encrypted(&key, "first", "record");
     journal.enqueue(first.clone(), None, 0, None).unwrap();
+    let initial_local_revision = journal.stats().unwrap().4;
     let second = encrypted(&key, "second", "record");
     assert!(matches!(
         journal.enqueue(second.clone(), None, 0, None),
@@ -177,7 +178,10 @@ fn offline_edits_coalesce_but_claimed_bytes_and_successor_order_survive_restart(
     journal
         .enqueue(second.clone(), None, 0, Some("first".into()))
         .unwrap();
-    let record = journal.record_page("").unwrap().0.remove(0);
+    let (mut records, cursor, local_revision) = journal.record_page("").unwrap();
+    assert_eq!(cursor, 0);
+    assert!(local_revision > initial_local_revision);
+    let record = records.remove(0);
     assert_eq!(record.entity.body, second);
     assert_eq!(record.entity.revision, 0);
     assert_eq!(record.entity.pending_id.as_deref(), Some("second"));
@@ -227,12 +231,15 @@ fn offline_edits_coalesce_but_claimed_bytes_and_successor_order_survive_restart(
         .unwrap();
     assert_eq!(journal.counts().unwrap(), (0, 0));
     assert!(journal.caught_up(2, 123).unwrap());
+    let stats = journal.stats().unwrap();
+    assert_eq!((stats.0, stats.1, stats.2, stats.3), (0, 0, 2, 123));
+    assert!(stats.4 > 0);
     assert_eq!(
         Journal::open(owned.0.join("replica.db"))
             .unwrap()
             .stats()
             .unwrap(),
-        (0, 0, 2, 123)
+        stats
     );
 }
 #[test]

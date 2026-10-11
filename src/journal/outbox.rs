@@ -21,9 +21,17 @@ impl Journal {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(sql_failed)?
         };
+        let mut changed = 0;
         for entry in &entries {
-            tx.execute("UPDATE outbox SET dispatched=1 WHERE id=?1", [&entry.id])
+            changed += tx
+                .execute(
+                    "UPDATE outbox SET dispatched=1 WHERE id=?1 AND dispatched=0",
+                    [&entry.id],
+                )
                 .map_err(sql_failed)?;
+        }
+        if changed > 0 {
+            bump(&tx)?;
         }
         tx.commit().map_err(sql_failed)?;
         Ok(entries)
@@ -95,7 +103,8 @@ impl Journal {
             return Err(Error::Busy);
         }
         tx.execute("INSERT INTO outbox(id,kind,entity_id,body,state,dispatched,predecessor) VALUES(?1,?2,?3,?4,'pending',0,?5)",params![operation.operation_id,kind,operation.entity_id,body,predecessor]).map_err(sql_failed)?;
-        let receipt=tx.query_row("SELECT (SELECT count(*) FROM outbox WHERE state='pending'),((SELECT count(*) FROM conflicts)+(SELECT count(*) FROM outbox o WHERE state='conflict' AND NOT EXISTS(SELECT 1 FROM conflicts c WHERE c.kind=o.kind AND c.entity_id=o.entity_id))),cursor FROM meta WHERE singleton=1",[],|r|Ok(Enqueued{id:operation.operation_id.clone(),pending:r.get(0)?,conflicts:r.get(1)?,cursor:r.get(2)?})).map_err(sql_failed)?;
+        bump(&tx)?;
+        let receipt=tx.query_row("SELECT (SELECT count(*) FROM outbox WHERE state='pending'),((SELECT count(*) FROM conflicts)+(SELECT count(*) FROM outbox o WHERE state='conflict' AND NOT EXISTS(SELECT 1 FROM conflicts c WHERE c.kind=o.kind AND c.entity_id=o.entity_id))),cursor,local_revision FROM meta WHERE singleton=1",[],|r|Ok(Enqueued{id:operation.operation_id.clone(),pending:r.get(0)?,conflicts:r.get(1)?,cursor:r.get(2)?,local_revision:r.get(3)?})).map_err(sql_failed)?;
         tx.commit().map_err(sql_failed)?;
         Ok(receipt)
     }
@@ -124,6 +133,7 @@ impl Journal {
             let operation = serde_json::from_slice(&body).map_err(failed)?;
             apply(&tx, &operation, &body, &outcome, result, resolved)?;
             settle(&tx, id, &outcome)?;
+            bump(&tx)?;
         }
         // Another process may already have ingested this exact server receipt.
         tx.commit().map_err(sql_failed)
@@ -171,6 +181,9 @@ impl Journal {
         if page.next_after_seq != previous || page.has_more && page.entries.is_empty() {
             return Err(Error::Invalid);
         }
+        if !page.entries.is_empty() {
+            bump(&tx)?;
+        }
         tx.execute("UPDATE meta SET cursor=?1 WHERE singleton=1", [previous])
             .map_err(sql_failed)?;
         tx.commit().map_err(sql_failed)
@@ -189,5 +202,14 @@ fn settle(tx: &rusqlite::Transaction<'_>, id: &str, outcome: &wire::Sync) -> Res
     .map_err(sql_failed)?;
     tx.execute("DELETE FROM outbox WHERE id=?1", [id])
         .map_err(sql_failed)?;
+    Ok(())
+}
+
+fn bump(tx: &rusqlite::Transaction<'_>) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE meta SET local_revision=local_revision+1 WHERE singleton=1",
+        [],
+    )
+    .map_err(sql_failed)?;
     Ok(())
 }

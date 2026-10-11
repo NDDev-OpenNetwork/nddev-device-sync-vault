@@ -32,12 +32,12 @@ impl Journal {
             })
             .map_err(sql_failed)
     }
-    pub fn stats(&self) -> Result<(u32, u32, u64, u64), Error> {
-        self.connection()?.query_row("SELECT (SELECT count(*) FROM outbox WHERE state='pending'),((SELECT count(*) FROM conflicts)+(SELECT count(*) FROM outbox o WHERE state='conflict' AND NOT EXISTS(SELECT 1 FROM conflicts c WHERE c.kind=o.kind AND c.entity_id=o.entity_id))),cursor,last_sync_at FROM meta WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(sql_failed)
+    pub fn stats(&self) -> Result<(u32, u32, u64, u64, u64), Error> {
+        self.connection()?.query_row("SELECT (SELECT count(*) FROM outbox WHERE state='pending'),((SELECT count(*) FROM conflicts)+(SELECT count(*) FROM outbox o WHERE state='conflict' AND NOT EXISTS(SELECT 1 FROM conflicts c WHERE c.kind=o.kind AND c.entity_id=o.entity_id))),cursor,last_sync_at,local_revision FROM meta WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map_err(sql_failed)
     }
     #[cfg(test)]
     pub fn counts(&self) -> Result<(u32, u32), Error> {
-        let (p, c, _, _) = self.stats()?;
+        let (p, c, _, _, _) = self.stats()?;
         Ok((p, c))
     }
     pub fn entity(&self, kind: &str, id: &str) -> Result<Option<Entity>, Error> {
@@ -56,7 +56,7 @@ impl Journal {
         tx.commit().map_err(sql_failed)?;
         Ok((entity, conflict, cursor))
     }
-    pub fn record_page(&self, after: &str) -> Result<(Vec<RecordEntry>, u64), Error> {
+    pub fn record_page(&self, after: &str) -> Result<(Vec<RecordEntry>, u64, u64), Error> {
         let mut connection = self.connection()?;
         let tx = connection.transaction().map_err(sql_failed)?;
         let mut entries = {
@@ -78,13 +78,15 @@ impl Journal {
                 entry.conflict = conflict(&tx, &entry.id)?;
             }
         }
-        let cursor = tx
-            .query_row("SELECT cursor FROM meta WHERE singleton=1", [], |r| {
-                r.get(0)
-            })
+        let (cursor, local_revision) = tx
+            .query_row(
+                "SELECT cursor,local_revision FROM meta WHERE singleton=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .map_err(sql_failed)?;
         tx.commit().map_err(sql_failed)?;
-        Ok((entries, cursor))
+        Ok((entries, cursor, local_revision))
     }
     pub fn latest_clipboard(&self) -> Result<Option<(String, Entity)>, Error> {
         self.connection()?.query_row("SELECT revision,body,server_seq,EXISTS(SELECT 1 FROM conflicts WHERE kind='clipboard_item' AND entity_id=entities.id),NULL,revision,id FROM entities WHERE kind='clipboard_item' AND server_seq>0 ORDER BY server_seq DESC LIMIT 1",[],|r|Ok((r.get(6)?,read_entity(r)?))).optional().map_err(sql_failed)

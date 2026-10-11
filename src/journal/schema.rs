@@ -35,7 +35,11 @@ impl Journal {
                 UPDATE meta SET schema_version=3 WHERE singleton=1;").map_err(sql_failed)?;
             version = 3;
         }
-        if version != 3 {
+        if version == 3 {
+            tx.execute_batch("ALTER TABLE meta ADD COLUMN local_revision INTEGER NOT NULL DEFAULT 0 CHECK(local_revision BETWEEN 0 AND 9007199254740991); UPDATE meta SET schema_version=4 WHERE singleton=1;").map_err(sql_failed)?;
+            version = 4;
+        }
+        if version != 4 {
             return Err(Error::Invalid);
         }
         // One bounded projection owns local read-your-writes. Server revision

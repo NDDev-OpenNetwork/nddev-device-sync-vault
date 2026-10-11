@@ -117,13 +117,15 @@ impl VaultClient {
     }
     async fn update_view(&self) -> Result<VaultView, Error> {
         let key = self.key().await?;
-        let (pending, conflicts, cursor, last_sync_at) = self.journal.stats().await?;
+        let (pending, conflicts, cursor, last_sync_at, local_revision) =
+            self.journal.stats().await?;
         let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
         view.unlocked = key.is_some();
         view.key_id = key.as_ref().map(VaultKey::id).unwrap_or_default();
         view.pending = pending;
         view.conflicts = conflicts;
         view.cursor = cursor;
+        view.local_revision = local_revision;
         view.last_sync_at = last_sync_at;
         Ok(view.clone())
     }
@@ -300,6 +302,7 @@ impl VaultClient {
         view.pending = receipt.pending;
         view.conflicts = receipt.conflicts;
         view.cursor = receipt.cursor;
+        view.local_revision = receipt.local_revision;
         view.catching_up = true;
         Ok(receipt.id)
     }
@@ -406,7 +409,7 @@ impl VaultClient {
             return Err(Error::Invalid);
         }
         let key = self.key().await?.ok_or(Error::Locked)?;
-        let (mut entities, observed_seq) = self.journal.record_page(after).await?;
+        let (mut entities, observed_seq, local_revision) = self.journal.record_page(after).await?;
         let has_more = entities.len() > 50;
         entities.truncate(50);
         let next_after = entities
@@ -450,6 +453,7 @@ impl VaultClient {
         }
         Ok(RecordPage {
             observed_seq,
+            local_revision,
             items,
             next_after,
             has_more,
@@ -851,7 +855,7 @@ impl VaultClient {
                 break;
             }
         }
-        let (pending, _, _, _) = self.journal.stats().await?;
+        let (pending, _, _, _, _) = self.journal.stats().await?;
         let caught_up = if !more && pending == 0 {
             self.journal
                 .caught_up(
@@ -1160,7 +1164,7 @@ mod tests {
             // recovers committed sequence without resetting any native key.
             let path=vault.journal.path_for_acceptance();
             let sqlite=rusqlite::Connection::open(&path).map_err(dependency)?;
-            sqlite.execute_batch("DROP VIEW local_entities; DROP INDEX outbox_unsent; DROP INDEX outbox_dispatched; DROP INDEX conflict_entity; ALTER TABLE outbox DROP COLUMN predecessor; ALTER TABLE outbox DROP COLUMN dispatched; ALTER TABLE meta DROP COLUMN last_sync_at; ALTER TABLE entities DROP COLUMN server_seq; UPDATE meta SET schema_version=1;").map_err(dependency)?;drop(sqlite);
+            sqlite.execute_batch("DROP VIEW local_entities; DROP INDEX outbox_unsent; DROP INDEX outbox_dispatched; DROP INDEX conflict_entity; ALTER TABLE outbox DROP COLUMN predecessor; ALTER TABLE outbox DROP COLUMN dispatched; ALTER TABLE meta DROP COLUMN last_sync_at; ALTER TABLE meta DROP COLUMN local_revision; ALTER TABLE entities DROP COLUMN server_seq; UPDATE meta SET schema_version=1;").map_err(dependency)?;drop(sqlite);
             let migrated=VaultClient::new(identity.clone(),directory.clone()).await?;
             assert!(matches!(migrated.clipboard().await,Err(Error::Busy)));
             let mut progress=migrated.synchronize().await?;while progress.catching_up{progress=migrated.synchronize().await?;}

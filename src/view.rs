@@ -6,6 +6,8 @@ pub struct VaultView {
     pub pending: u32,
     pub conflicts: u32,
     pub cursor: u64,
+    /// Local durable mutation counter, independent of the committed cursor.
+    pub local_revision: u64,
     pub last_sync_at: u64,
     pub catching_up: bool,
     pub sync_error: String,
@@ -34,6 +36,7 @@ pub struct RecordView {
 #[derive(Clone)]
 pub struct RecordPage {
     pub observed_seq: u64,
+    pub local_revision: u64,
     pub items: Vec<RecordView>,
     pub next_after: String,
     pub has_more: bool,

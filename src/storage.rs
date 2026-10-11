@@ -82,11 +82,11 @@ fn completed(
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Reply {
-    Stats(u32, u32, u64, u64),
+    Stats(u32, u32, u64, u64, u64),
     Pending(Vec<Pending>),
     Cursor(u64),
     Entity(Option<Entity>),
-    Records(Vec<RecordEntry>, u64),
+    Records(Vec<RecordEntry>, u64, u64),
     Resolution(Entity, Option<Vec<u8>>, u64),
     Bool(bool),
     Clipboard(Option<(String, Entity)>),
@@ -98,15 +98,15 @@ pub(crate) enum Reply {
 pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Error> {
     Ok(match command {
         Command::Stats => {
-            let (pending, conflicts, cursor, at) = journal.stats()?;
-            Reply::Stats(pending, conflicts, cursor, at)
+            let (pending, conflicts, cursor, at, local) = journal.stats()?;
+            Reply::Stats(pending, conflicts, cursor, at, local)
         }
         Command::Pending => Reply::Pending(journal.pending()?),
         Command::Cursor => Reply::Cursor(journal.cursor()?),
         Command::Entity { kind, id } => Reply::Entity(journal.entity(&kind, &id)?),
         Command::Records { after } => {
-            let (items, cursor) = journal.record_page(&after)?;
-            Reply::Records(items, cursor)
+            let (items, cursor, local) = journal.record_page(&after)?;
+            Reply::Records(items, cursor, local)
         }
         Command::Resolution { id } => {
             let (e, c, s) = journal.resolution(&id)?;
@@ -217,9 +217,9 @@ impl Storage {
             receive.await.map_err(|_| Error::Unavailable)?
         }
     }
-    pub async fn stats(&self) -> Result<(u32, u32, u64, u64), Error> {
+    pub async fn stats(&self) -> Result<(u32, u32, u64, u64, u64), Error> {
         match self.call(Command::Stats).await? {
-            Reply::Stats(p, c, s, at) => Ok((p, c, s, at)),
+            Reply::Stats(p, c, s, at, l) => Ok((p, c, s, at, l)),
             _ => Err(Error::Invalid),
         }
     }
@@ -247,9 +247,9 @@ impl Storage {
             _ => Err(Error::Invalid),
         }
     }
-    pub async fn record_page(&self, after: String) -> Result<(Vec<RecordEntry>, u64), Error> {
+    pub async fn record_page(&self, after: String) -> Result<(Vec<RecordEntry>, u64, u64), Error> {
         match self.call(Command::Records { after }).await? {
-            Reply::Records(v, c) => Ok((v, c)),
+            Reply::Records(v, c, l) => Ok((v, c, l)),
             _ => Err(Error::Invalid),
         }
     }

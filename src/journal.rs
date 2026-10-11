@@ -31,6 +31,7 @@ pub struct Enqueued {
     pub pending: u32,
     pub conflicts: u32,
     pub cursor: u64,
+    pub local_revision: u64,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct RecordEntry {

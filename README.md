@@ -41,7 +41,9 @@ conflict blocks that successor and preserves its latest intent for explicit
 resolution. Both append receipts and inbox replay release successors atomically.
 The queue stays bounded at 1024 operations. Refresh reads last complete sync time
 from durable metadata; offline access retains the original authorization expiry.
-Do not downgrade a schema 3 database to an older client.
+Schema 4 adds a durable local mutation counter for presentation refresh across
+tabs/processes, independent of the server cursor. Do not downgrade this journal
+to an older client.
 
 Browser qualification must exercise the actual composition root, credentials,
 worker restart, cross-tab writes and storage eviction/quota behavior. Browser
