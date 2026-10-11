@@ -1568,8 +1568,8 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-accounts"
-version = "0.0.1-alpha.16"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git?rev=d699c7b74274d651ca5e64d1e3442d09965c6562#d699c7b74274d651ca5e64d1e3442d09965c6562"
+version = "0.0.1-alpha.17"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git?rev=fb65330c593d2617b6d9d0e03ffeba81887467c2#fb65330c593d2617b6d9d0e03ffeba81887467c2"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
@@ -1615,7 +1615,7 @@ dependencies = [
 [[package]]
 name = "nddev-device-sync-http-signatures"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-protocol.git?rev=3e5cbe56a3a810e3b7c7f16f0dc1f67a63ab1ac2#3e5cbe56a3a810e3b7c7f16f0dc1f67a63ab1ac2"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-protocol.git?rev=dbafb78c3ac133a31e465c9ac68215ee7cae3954#dbafb78c3ac133a31e465c9ac68215ee7cae3954"
 dependencies = [
  "base64 0.22.1",
  "httpsig",
@@ -1626,7 +1626,7 @@ dependencies = [
 [[package]]
 name = "nddev-device-sync-telemetry"
 version = "0.0.1-alpha.5"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability?rev=ff6d0ff149712c39b90a5d4d89e2768ab2e6db5a#ff6d0ff149712c39b90a5d4d89e2768ab2e6db5a"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability?rev=469a77aea2e234b50d0554625a761d52985e7cb0#469a77aea2e234b50d0554625a761d52985e7cb0"
 dependencies = [
  "android_log-sys",
  "chrono",
