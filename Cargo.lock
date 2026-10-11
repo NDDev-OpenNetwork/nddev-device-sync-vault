@@ -725,7 +725,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1547,8 +1547,8 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-accounts"
-version = "0.0.1-alpha.12"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git?rev=bc90ebc829525eccf0f9ec0729d720ffeb458b16#bc90ebc829525eccf0f9ec0729d720ffeb458b16"
+version = "0.0.1-alpha.13"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git?rev=66795c6dfc074675082b0f80e6d0681693388618#66795c6dfc074675082b0f80e6d0681693388618"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
@@ -1582,17 +1582,19 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-domain"
-version = "0.0.2"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git?rev=3400a9d766fa2838973fab96981806c9c25eef5d#3400a9d766fa2838973fab96981806c9c25eef5d"
+version = "0.0.3"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git?rev=e87368c53bd524caeabc1e14743c96fcfd87da77#e87368c53bd524caeabc1e14743c96fcfd87da77"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
 name = "nddev-device-sync-http-signatures"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-protocol.git?rev=28c3182a40750ca6cc6ec3f96658346cfde8ec16#28c3182a40750ca6cc6ec3f96658346cfde8ec16"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-protocol.git?rev=9f1698f7042f6f4b4832e7aed70403d0f3ad8218#9f1698f7042f6f4b4832e7aed70403d0f3ad8218"
 dependencies = [
  "base64 0.22.1",
  "httpsig",
@@ -1602,8 +1604,8 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-telemetry"
-version = "0.0.1-alpha.2"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability?rev=7ae68ea764b3f0e639d551b059eb0651a50b5edd#7ae68ea764b3f0e639d551b059eb0651a50b5edd"
+version = "0.0.1-alpha.3"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability?rev=863a0caad5a06a450a0d99a23675bfb5b5959b2e#863a0caad5a06a450a0d99a23675bfb5b5959b2e"
 dependencies = [
  "android_log-sys",
  "chrono",
@@ -1621,7 +1623,7 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-vault"
-version = "0.0.1-alpha.1"
+version = "0.0.1-alpha.2"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -1634,6 +1636,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.21",
+ "time",
  "tokio",
  "uuid",
  "zeroize",
@@ -2217,7 +2220,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2273,7 +2276,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2640,7 +2643,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3144,7 +3147,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

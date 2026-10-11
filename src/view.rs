@@ -7,8 +7,8 @@ pub struct VaultView {
     pub conflicts: u32,
     pub cursor: u64,
     pub last_sync_at: u64,
-    pub pairing_code: String,
-    pub pairing_fingerprint: String,
+    pub catching_up: bool,
+    pub sync_error: String,
 }
 #[derive(Clone)]
 pub struct RecordView {
@@ -20,10 +20,27 @@ pub struct RecordView {
 }
 
 #[derive(Clone)]
-pub struct PairingPeer {
+pub struct StateView {
+    pub kind: String,
+    pub id: String,
     pub device_id: String,
-    pub name: String,
-    pub fingerprint: String,
+    pub label: String,
+    pub version: String,
+    pub platform: String,
+    pub reachability: String,
+    pub configured: bool,
+    pub checked_at_ms: u64,
+    pub observed_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub error_class: String,
+    pub revision: u64,
+    pub conflicted: bool,
+}
+#[derive(Clone)]
+pub struct StatePage {
+    pub items: Vec<StateView>,
+    pub next_after: String,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -38,8 +55,8 @@ pub enum VaultError {
     Unavailable,
     #[error("vault_busy")]
     Busy,
-    #[error("vault_key_exists")]
-    KeyExists,
+    #[error("vault_key_registration_required")]
+    RegistrationRequired,
 }
 
 impl VaultError {
