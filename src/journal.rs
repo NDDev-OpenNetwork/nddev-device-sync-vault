@@ -21,6 +21,7 @@ pub struct Entity {
     pub revision: u64,
     pub body: Vec<u8>,
     pub conflicted: bool,
+    pub server_seq: u64,
 }
 fn failed<E>(_: E) -> Error {
     Error::Unavailable
@@ -52,7 +53,7 @@ impl Journal {
             return Err(Error::Invalid);
         }
         let journal = Self { path };
-        let connection = journal.connection()?;
+        let mut connection = journal.connection()?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),schema_version INTEGER NOT NULL,cursor INTEGER NOT NULL DEFAULT 0 CHECK(cursor BETWEEN 0 AND 9007199254740991));
             INSERT OR IGNORE INTO meta(singleton,schema_version) VALUES(1,1);
             CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,kind TEXT NOT NULL,entity_id TEXT NOT NULL,body BLOB NOT NULL CHECK(length(body)<=24576),state TEXT NOT NULL CHECK(state IN ('pending','conflict')));
@@ -66,7 +67,26 @@ impl Journal {
                 |row| row.get(0),
             )
             .map_err(failed)?;
-        if version != 1 {
+        if version == 1 {
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(failed)?;
+            let current: i64 = tx
+                .query_row(
+                    "SELECT schema_version FROM meta WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(failed)?;
+            // Preserve ciphertext, pending operations and conflicts. Replay the
+            // existing stream to recover committed ordering absent in schema1.
+            if current == 1 {
+                tx.execute_batch("ALTER TABLE entities ADD COLUMN server_seq INTEGER NOT NULL DEFAULT 0 CHECK(server_seq BETWEEN 0 AND 9007199254740991); UPDATE meta SET schema_version=2,cursor=0 WHERE singleton=1;").map_err(failed)?;
+            } else if current != 2 {
+                return Err(Error::Invalid);
+            }
+            tx.commit().map_err(failed)?;
+        } else if version != 2 {
             return Err(Error::Invalid);
         }
         Ok(journal)
@@ -139,11 +159,11 @@ impl Journal {
         self.connection()?.query_row("SELECT (SELECT count(*) FROM outbox WHERE state='pending'),(SELECT count(*) FROM conflicts)",[],|row|Ok((row.get(0)?,row.get(1)?))).map_err(failed)
     }
     pub fn entity(&self, kind: &str, id: &str) -> Result<Option<Entity>, Error> {
-        self.connection()?.query_row("SELECT revision,body,EXISTS(SELECT 1 FROM conflicts WHERE kind=?1 AND entity_id=?2) FROM entities WHERE kind=?1 AND id=?2",params![kind,id],|row|Ok(Entity{revision:row.get(0)?,body:row.get(1)?,conflicted:row.get(2)?})).optional().map_err(failed)
+        self.connection()?.query_row("SELECT revision,body,server_seq,EXISTS(SELECT 1 FROM conflicts WHERE kind=?1 AND entity_id=?2) FROM entities WHERE kind=?1 AND id=?2",params![kind,id],|row|Ok(Entity{revision:row.get(0)?,body:row.get(1)?,server_seq:row.get(2)?,conflicted:row.get(3)?})).optional().map_err(failed)
     }
     pub fn list(&self, kind: &str) -> Result<Vec<(String, Entity)>, Error> {
         let connection = self.connection()?;
-        let mut query=connection.prepare("SELECT id,revision,body,EXISTS(SELECT 1 FROM conflicts WHERE kind=?1 AND entity_id=entities.id) FROM entities WHERE kind=?1 ORDER BY id LIMIT 100").map_err(failed)?;
+        let mut query=connection.prepare("SELECT id,revision,body,server_seq,EXISTS(SELECT 1 FROM conflicts WHERE kind=?1 AND entity_id=entities.id) FROM entities WHERE kind=?1 ORDER BY id LIMIT 100").map_err(failed)?;
         query
             .query_map([kind], |row| {
                 Ok((
@@ -151,13 +171,20 @@ impl Journal {
                     Entity {
                         revision: row.get(1)?,
                         body: row.get(2)?,
-                        conflicted: row.get(3)?,
+                        server_seq: row.get(3)?,
+                        conflicted: row.get(4)?,
                     },
                 ))
             })
             .map_err(failed)?
             .collect::<Result<_, _>>()
             .map_err(failed)
+    }
+    pub fn has_pending(&self, kind: &str, id: &str) -> Result<bool, Error> {
+        self.connection()?.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE kind=?1 AND entity_id=?2 AND state='pending')",params![kind,id],|row|row.get(0)).map_err(failed)
+    }
+    pub fn latest_clipboard(&self) -> Result<Option<(String, Entity)>, Error> {
+        self.connection()?.query_row("SELECT id,revision,body,server_seq,EXISTS(SELECT 1 FROM conflicts WHERE kind='clipboard_item' AND entity_id=entities.id) FROM entities WHERE kind='clipboard_item' AND server_seq>0 ORDER BY server_seq DESC LIMIT 1",[],|row|Ok((row.get(0)?,Entity { revision:row.get(1)?,body:row.get(2)?,server_seq:row.get(3)?,conflicted:row.get(4)? }))).optional().map_err(failed)
     }
     pub fn enqueue(&self, body: Vec<u8>) -> Result<String, Error> {
         if body.len() > 24576 {
@@ -195,7 +222,7 @@ impl Journal {
     ) -> Result<Vec<(String, String, Entity)>, Error> {
         let connection = self.connection()?;
         let (kind, id) = after.map_or((None, None), |(kind, id)| (Some(kind), Some(id)));
-        let mut query=connection.prepare("SELECT kind,id,revision,body,EXISTS(SELECT 1 FROM conflicts WHERE kind=entities.kind AND entity_id=entities.id) FROM entities WHERE kind IN ('device_state','module_state','account_state') AND (?1 IS NULL OR (kind,id)>(?1,?2)) ORDER BY kind,id LIMIT 51").map_err(failed)?;
+        let mut query=connection.prepare("SELECT kind,id,revision,body,EXISTS(SELECT 1 FROM conflicts WHERE kind=entities.kind AND entity_id=entities.id),server_seq FROM entities WHERE kind IN ('device_state','module_state','account_state') AND (?1 IS NULL OR (kind,id)>(?1,?2)) ORDER BY kind,id LIMIT 51").map_err(failed)?;
         query
             .query_map(params![kind, id], |row| {
                 Ok((
@@ -205,6 +232,7 @@ impl Journal {
                         revision: row.get(2)?,
                         body: row.get(3)?,
                         conflicted: row.get(4)?,
+                        server_seq: row.get(5)?,
                     },
                 ))
             })
@@ -291,7 +319,7 @@ fn apply(
             {
                 return Err(Error::Invalid);
             }
-            tx.execute("INSERT INTO entities(kind,id,revision,body) VALUES(?1,?2,?3,?4) ON CONFLICT(kind,id) DO UPDATE SET revision=EXCLUDED.revision,body=EXCLUDED.body WHERE entities.revision<EXCLUDED.revision",params![kind,operation.entity_id,value.revision,body]).map_err(failed)?;
+            tx.execute("INSERT INTO entities(kind,id,revision,body,server_seq) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(kind,id) DO UPDATE SET revision=EXCLUDED.revision,body=EXCLUDED.body,server_seq=EXCLUDED.server_seq WHERE entities.revision<EXCLUDED.revision OR (entities.revision=EXCLUDED.revision AND entities.body=EXCLUDED.body AND entities.server_seq=0)",params![kind,operation.entity_id,value.revision,body,value.server_seq]).map_err(failed)?;
         }
         wire::Sync::Conflict(value) => {
             if value.operation_id != operation.operation_id
