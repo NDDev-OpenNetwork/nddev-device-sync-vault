@@ -1,6 +1,6 @@
 [package]
 name = "nddev-device-sync-vault"
-version = "0.0.1-alpha.4"
+version = "0.0.1-alpha.5"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
@@ -17,10 +17,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zeroize = { version = "1.8", features = ["serde"] }
 thiserror = "2"
+tracing = "0.1"
+nddev-device-sync-telemetry = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability", rev = "4b8dfb54168db648f76fb39d2d0cfb1ba7133a9b" }
+time = { version = "0.3", features = ["wasm-bindgen"] }
 uuid = { version = "1.27", features = ["v4"] }
-nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "d08e6b34c9ff6af1fdc179291f5386ec73c84926" }
-nddev-device-sync-accounts = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git", rev = "e4f41528fdd668ce32105576546e84d2bea5b05f" }
-rusqlite = { version = "=0.40.2", default-features = false, features = ["libsqlite3-sys", "bundled", "fallible_uint"] }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "d5d16cc3f59aa879136c40d160e756d70c87b5da" }
+nddev-device-sync-accounts = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git", rev = "7fabebd60063e0f46c815d1ae979490399166d51" }
+
 tokio = { version = "1.53", features = ["rt", "sync", "time"] }
 sha2 = "0.10"
 
@@ -32,3 +35,15 @@ time = {version="0.3",features=["parsing"]}
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time"] }
 
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite = { version = "=0.40.2", default-features = false, features = ["libsqlite3-sys", "bundled", "fallible_uint"] }
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rusqlite = { version="=0.40.2",default-features=false,features=["ffi-sqlite-wasm-rs","fallible_uint"] }
+sqlite-wasm-rs = "=0.5.5"
+sqlite-wasm-vfs = "=0.2.0"
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "=0.4.79"
+js-sys = "=0.3.106"
+uuid = { version="1.27",features=["js"] }
+ring = { version="0.17",features=["wasm32_unknown_unknown_js"] }

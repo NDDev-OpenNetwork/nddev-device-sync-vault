@@ -6,9 +6,14 @@ pub struct VaultView {
     pub pending: u32,
     pub conflicts: u32,
     pub cursor: u64,
+    /// Local durable mutation counter, independent of the committed cursor.
+    pub local_revision: u64,
     pub last_sync_at: u64,
     pub catching_up: bool,
     pub sync_error: String,
+    /// Browser retention preference observed at client startup; native is None.
+    /// Even persistent browser storage can be cleared explicitly by the user.
+    pub browser_persistent: Option<bool>,
 }
 #[derive(Clone)]
 pub struct ConflictView {
@@ -25,6 +30,8 @@ pub struct RecordView {
     pub title: String,
     pub username: String,
     pub revision: u64,
+    /// Local operation identity for optimistic editing; not a server revision.
+    pub pending_id: Option<String>,
     pub conflicted: bool,
     pub conflict: Option<ConflictView>,
 }
@@ -32,6 +39,7 @@ pub struct RecordView {
 #[derive(Clone)]
 pub struct RecordPage {
     pub observed_seq: u64,
+    pub local_revision: u64,
     pub items: Vec<RecordView>,
     pub next_after: String,
     pub has_more: bool,
@@ -61,7 +69,9 @@ pub struct StatePage {
     pub has_more: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize,
+)]
 pub enum VaultError {
     #[error("vault_invalid_input")]
     Invalid,
@@ -73,6 +83,8 @@ pub enum VaultError {
     Unavailable,
     #[error("vault_busy")]
     Busy,
+    #[error("vault_storage_full")]
+    StorageFull,
     #[error("vault_key_registration_required")]
     RegistrationRequired,
 }

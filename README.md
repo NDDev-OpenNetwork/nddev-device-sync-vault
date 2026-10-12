@@ -1,8 +1,8 @@
 # nddev-device-sync-vault
 
-Native encrypted replica adapters for [NDDev OpenNetwork](https://nddev.ai), AGPL-3.0-only. Rust owns automatic server-managed key provisioning, authenticated record encryption and durable ciphertext queues; presentation receives state and record labels only.
+Encrypted native and browser replica adapters for [NDDev OpenNetwork](https://nddev.ai), AGPL-3.0-only. Rust owns automatic server-managed key provisioning, authenticated record encryption and durable ciphertext queues; presentation receives state and record labels only.
 
-AES-256-GCM binds ciphertext to owner, origin, entity, operation and revision. After authentication and device enrollment, the native client receives its established owner key through signed HTTPS and retains it in the native credential store. An existing local key registers once without replacement. The server has decryption authority under ADR 0006; this is not client-only E2EE. No backup, recovery or implicit rotation exists.
+AES-256-GCM binds ciphertext to owner, origin, entity, operation and revision. After authentication and device enrollment, the client receives its established owner key through signed HTTPS and retains it in the platform credential adapter. Native clients use the OS credential store; the browser wraps local key material with its non-extractable WebCrypto key in IndexedDB. An existing local key registers once without replacement. The server has decryption authority under ADR 0006; this is not client-only E2EE. No backup, recovery or implicit rotation exists.
 
 SQLite stores ciphertext, revisions, pending operations and explicit conflicts. A mutation is durable before local acknowledgement; network retries preserve exact bytes with fresh HTTP signatures. Inbox cursors advance in the same transaction as their retained entries. Queues, pages, storage and worker admission are bounded. Partial batches expose `catching_up`; only a fully caught-up observation advances `last_sync_at`.
 
@@ -25,3 +25,30 @@ before records or cursor advance. A damaged page leaves both cursor and caught-u
 time unchanged. The native acceptance covers 154 records across page boundaries,
 deleted-record conflicts, both resolution choices and an actual corrupt server
 entry; it runs only against its disposable fixture.
+
+Browser builds run the same Rust journal SQL in a dedicated worker backed by
+OPFS SAH-pool storage. A Web Lock covers each transaction and VFS handle lifetime;
+the connection closes and VFS pauses before release. There is no memory-only
+fallback. The composition root configures same-origin worker/module assets and
+exports the four functions documented in `src/browser.rs`; no plaintext or keys
+cross the journal command boundary. `just wasm-check` is a compile gate.
+
+Schema 3 preserves legacy outbox bytes as potentially dispatched. New unsent
+edits are visible locally and may be replaced only using the displayed
+`pending_id` together with the committed revision. Once claimed for transport,
+an operation is immutable; later edits form one coalescible successor. A server
+conflict blocks that successor and preserves its latest intent for explicit
+resolution. Both append receipts and inbox replay release successors atomically.
+The queue stays bounded at 1024 operations. Refresh reads last complete sync time
+from durable metadata; offline access retains the original authorization expiry.
+Schema 4 adds a durable local mutation counter for presentation refresh across
+tabs/processes, independent of the server cursor. Do not downgrade this journal
+to an older client.
+
+Browser qualification must exercise the actual composition root, credentials,
+worker restart, cross-tab writes and storage eviction/quota behavior. Browser
+profile storage may be evicted unless the browser grants persistence. The client
+requests that preference at startup and reports the observed result; it never
+claims protection from explicit site-data removal. Admission allows at most
+four concurrent storage calls, with a 500 ms wait for the connection; local
+acknowledgement is a completed storage transaction, not a cloud acknowledgement.

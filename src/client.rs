@@ -1,7 +1,7 @@
 use crate::{
     Error, codec,
     crypto::{Scope, VaultKey},
-    journal::Journal,
+    storage::Storage,
 };
 use nddev_device_sync_accounts::{IdentityClient, SyncRequest, sync_wire as wire};
 use nddev_device_sync_domain::vault::Record;
@@ -14,7 +14,6 @@ use sha2::{Digest, Sha256};
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
@@ -25,18 +24,27 @@ use nddev_device_sync_domain::state::{Reachability, Snapshot, State};
 struct Expected {
     revision: u64,
     cursor: Option<u64>,
+    pending: Option<String>,
 }
 pub struct VaultClient {
     identity: Arc<IdentityClient>,
     scope: Scope,
-    journal: Journal,
+    journal: Storage,
     gate: Arc<Semaphore>,
-    io: Arc<Semaphore>,
+    sync_gate: Arc<Semaphore>,
     view: Mutex<VaultView>,
     expected_key: Mutex<Option<String>>,
 }
 fn dependency<E>(_: E) -> Error {
     Error::Unavailable
+}
+fn identity_failure(error: nddev_device_sync_accounts::ClientError) -> Error {
+    use nddev_device_sync_accounts::ClientError;
+    match error {
+        ClientError::Busy => Error::Busy,
+        ClientError::DeviceRevoked | ClientError::RevalidationRequired => Error::Locked,
+        _ => Error::Unavailable,
+    }
 }
 impl VaultClient {
     pub async fn new(identity: Arc<IdentityClient>, data_dir: PathBuf) -> Result<Self, Error> {
@@ -45,19 +53,35 @@ impl VaultClient {
             serde_json::to_vec(&(&scope.origin, &scope.tenant, &scope.user, &scope.device))
                 .map_err(dependency)?;
         let name = format!("{:x}.db", Sha256::digest(encoded));
-        let journal =
-            tokio::task::spawn_blocking(move || Journal::open(data_dir.join("sync").join(name)))
-                .await
-                .map_err(dependency)??;
-        Ok(Self {
+        let journal = Storage::open(data_dir.join("sync").join(name)).await?;
+        let client = Self {
             identity,
             scope,
             journal,
             gate: Arc::new(Semaphore::new(1)),
-            io: Arc::new(Semaphore::new(1)),
+            sync_gate: Arc::new(Semaphore::new(1)),
             view: Mutex::default(),
             expected_key: Mutex::default(),
-        })
+        };
+        client.update_view().await?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let persistent = crate::browser::request_persistence().await;
+            client
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .browser_persistent = Some(persistent);
+            tracing::event!(target:"nddev_device_sync_vault",tracing::Level::INFO,{
+                event.name="vault.storage.persistence",module="vault",scope="io",
+                outcome=if persistent {"accepted"} else {"unavailable"}
+            });
+        }
+        {
+            let mut view = client.view.lock().unwrap_or_else(|e| e.into_inner());
+            view.catching_up = view.pending > 0 || view.last_sync_at == 0;
+        }
+        Ok(client)
     }
     fn authorized(&self) -> Result<(), Error> {
         let current = scope(&self.identity)?;
@@ -76,24 +100,17 @@ impl VaultClient {
             .try_acquire_owned()
             .map_err(|_| Error::Busy)
     }
-    async fn local<T: Send + 'static>(
-        &self,
-        work: impl FnOnce(&Journal) -> Result<T, Error> + Send + 'static,
-    ) -> Result<T, Error> {
-        let journal = self.journal.clone();
-        let permit = self
-            .io
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Error::Busy)?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            work(&journal)
-        })
-        .await
-        .map_err(dependency)?
-    }
     async fn key(&self) -> Result<Option<VaultKey>, Error> {
+        if let Err(error) = self.identity.authorize_local().await {
+            let error = identity_failure(error);
+            if error == Error::Locked {
+                let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+                view.unlocked = false;
+                view.key_id.clear();
+                view.sync_error = error.code();
+            }
+            return Err(error);
+        }
         let secret = self
             .identity
             .vault_credentials()
@@ -126,26 +143,45 @@ impl VaultClient {
     }
     async fn update_view(&self) -> Result<VaultView, Error> {
         let key = self.key().await?;
-        let (pending, conflicts, cursor) = self
-            .local(|journal| {
-                let (pending, conflicts) = journal.counts()?;
-                Ok((pending, conflicts, journal.cursor()?))
-            })
-            .await?;
+        let (pending, conflicts, cursor, last_sync_at, local_revision) =
+            self.journal.stats().await?;
         let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        if local_revision < view.local_revision {
+            return Ok(view.clone());
+        }
         view.unlocked = key.is_some();
         view.key_id = key.as_ref().map(VaultKey::id).unwrap_or_default();
         view.pending = pending;
         view.conflicts = conflicts;
         view.cursor = cursor;
+        view.local_revision = local_revision;
+        view.catching_up |= pending > 0;
+        view.last_sync_at = last_sync_at;
         Ok(view.clone())
     }
     pub async fn refresh(&self) -> Result<VaultView, Error> {
         self.synchronize().await
     }
+    /// Re-read durable local state after a resume or another tab's notification.
+    /// Does not turn a cached authorization into a live server observation.
+    pub async fn refresh_local(&self) -> Result<VaultView, Error> {
+        let _permit = self.admitted()?;
+        self.update_view().await
+    }
     async fn ensure_key(&self) -> Result<(), Error> {
+        if !self.identity.view().session_verified {
+            let view = self.identity.refresh().await.map_err(identity_failure)?;
+            if !view.authenticated {
+                return Err(Error::Locked);
+            }
+            if !view.session_verified {
+                return Err(Error::Unavailable);
+            }
+            self.identity.refresh_devices().await.map_err(dependency)?;
+            self.authorized()?;
+        }
         self.discover_key().await?;
-        let lock = self.local(Journal::key_lock).await?;
+        let lock = self.journal.key_lock().await?;
         let existing = self.key().await?;
         let material = existing
             .as_ref()
@@ -192,7 +228,7 @@ impl VaultClient {
             .identity
             .sync_request(SyncRequest::Page { after: 0, limit: 1 })
             .await
-            .map_err(dependency)?;
+            .map_err(identity_failure)?;
         let page: wire::SyncPage =
             serde_json::from_slice(&reply.body).map_err(|_| Error::Invalid)?;
         let expected = if let Some(entry) = page.entries.first() {
@@ -255,13 +291,15 @@ impl VaultClient {
         }
         let key = self.key().await?.ok_or(Error::Locked)?;
         let entity_id = id.clone();
-        let existing = self
-            .local(move |journal| journal.entity(kind.as_str(), &entity_id))
-            .await?;
+        let existing = self.journal.entity(kind.as_str(), &entity_id).await?;
         let revision = existing.as_ref().map_or(0, |entity| entity.revision);
+        let pending = existing
+            .as_ref()
+            .and_then(|entity| entity.pending_id.clone());
+        let base = existing.as_ref().map_or(0, |entity| entity.next_base);
         if expected
             .as_ref()
-            .is_some_and(|expected| expected.revision != revision)
+            .is_some_and(|expected| expected.revision != revision || expected.pending != pending)
         {
             return Err(Error::Busy);
         }
@@ -272,7 +310,7 @@ impl VaultClient {
             device: DeviceId::new(&self.scope.device).map_err(dependency)?,
             entity_kind: kind,
             entity_id: id,
-            base_revision: revision,
+            base_revision: base,
             idempotency_key: operation_id,
             payload: EncryptedPayload {
                 key_id: key.id(),
@@ -283,17 +321,21 @@ impl VaultClient {
         operation.payload = key.encrypt(&self.scope, &operation, plaintext)?;
         let bytes = codec::body(&operation)?;
         let receipt = self
-            .local(move |journal| journal.enqueue(bytes, expected_cursor))
+            .journal
+            .enqueue(bytes, expected_cursor, revision, pending)
             .await?;
         // The transaction has committed. No subsequent native-store/SQLite read
         // may turn this durable success into an apparent failed mutation.
         let mut view = self.view.lock().unwrap_or_else(|error| error.into_inner());
-        view.unlocked = true;
-        view.key_id = key.id();
-        view.pending = receipt.pending;
-        view.conflicts = receipt.conflicts;
-        view.cursor = receipt.cursor;
-        view.catching_up = true;
+        if receipt.local_revision >= view.local_revision {
+            view.unlocked = true;
+            view.key_id = key.id();
+            view.pending = receipt.pending;
+            view.conflicts = receipt.conflicts;
+            view.cursor = receipt.cursor;
+            view.local_revision = receipt.local_revision;
+            view.catching_up = true;
+        }
         Ok(receipt.id)
     }
     pub async fn share_clipboard(&self, text: Zeroizing<String>) -> Result<String, Error> {
@@ -301,23 +343,8 @@ impl VaultClient {
         let payload =
             nddev_device_sync_domain::clipboard::Text::new(text).map_err(|_| Error::Invalid)?;
         let id = format!("{}:clipboard", self.scope.device);
-        if self
-            .local({
-                let id = id.clone();
-                move |journal| journal.has_pending("clipboard_item", &id)
-            })
-            .await?
-        {
-            return Err(Error::Busy);
-        }
         let plaintext = Zeroizing::new(serde_json::to_vec(&payload).map_err(dependency)?);
-        if let Some(previous) = self
-            .local({
-                let id = id.clone();
-                move |journal| journal.entity("clipboard_item", &id)
-            })
-            .await?
-        {
+        if let Some(previous) = self.journal.entity("clipboard_item", &id).await? {
             let wire: wire::SyncOperation =
                 serde_json::from_slice(&previous.body).map_err(dependency)?;
             let operation = codec::operation(&wire, previous.body.len())?;
@@ -344,7 +371,7 @@ impl VaultClient {
             return Err(Error::Busy);
         }
         let key = self.key().await?.ok_or(Error::Locked)?;
-        let Some((id, entity)) = self.local(Journal::latest_clipboard).await? else {
+        let Some((id, entity)) = self.journal.latest_clipboard().await? else {
             return Ok(None);
         };
         let wire: wire::SyncOperation = serde_json::from_slice(&entity.body).map_err(dependency)?;
@@ -370,6 +397,7 @@ impl VaultClient {
         &self,
         id: Option<String>,
         expected_revision: u64,
+        expected_pending: Option<String>,
         title: String,
         username: String,
         secret: Zeroizing<String>,
@@ -388,7 +416,8 @@ impl VaultClient {
         let id = id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let lookup = id.clone();
         if self
-            .local(move |journal| journal.entity("vault_record", &lookup))
+            .journal
+            .entity("vault_record", &lookup)
             .await?
             .is_some_and(|entity| entity.conflicted)
         {
@@ -401,6 +430,7 @@ impl VaultClient {
             Some(Expected {
                 revision: expected_revision,
                 cursor: None,
+                pending: expected_pending,
             }),
         )
         .await
@@ -411,9 +441,7 @@ impl VaultClient {
             return Err(Error::Invalid);
         }
         let key = self.key().await?.ok_or(Error::Locked)?;
-        let (mut entities, observed_seq) = self
-            .local(move |journal| journal.record_page(&after))
-            .await?;
+        let (mut entities, observed_seq, local_revision) = self.journal.record_page(after).await?;
         let has_more = entities.len() > 50;
         entities.truncate(50);
         let next_after = entities
@@ -449,6 +477,7 @@ impl VaultClient {
                     title: record.title,
                     username: record.username,
                     revision: entity.revision,
+                    pending_id: entity.pending_id,
                     conflicted: entity.conflicted,
                     conflict,
                 });
@@ -456,6 +485,7 @@ impl VaultClient {
         }
         Ok(RecordPage {
             observed_seq,
+            local_revision,
             items,
             next_after,
             has_more,
@@ -477,6 +507,7 @@ impl VaultClient {
         id: String,
         expected_revision: u64,
         expected_cursor: u64,
+        expected_pending: Option<String>,
         use_conflict: bool,
     ) -> Result<String, Error> {
         nddev_device_sync_domain::ModuleId::new(&id).map_err(|_| Error::Invalid)?;
@@ -485,18 +516,12 @@ impl VaultClient {
             return Err(Error::Busy);
         }
         let lookup = id.clone();
-        let (entity, conflict, cursor) = self
-            .local(move |journal| {
-                Ok((
-                    journal
-                        .entity("vault_record", &lookup)?
-                        .ok_or(Error::Invalid)?,
-                    journal.record_conflict(&lookup)?,
-                    journal.cursor()?,
-                ))
-            })
-            .await?;
-        if !entity.conflicted || entity.revision != expected_revision || cursor != expected_cursor {
+        let (entity, conflict, cursor) = self.journal.resolution(lookup).await?;
+        if !entity.conflicted
+            || entity.revision != expected_revision
+            || cursor != expected_cursor
+            || entity.pending_id != expected_pending
+        {
             return Err(Error::Busy);
         }
         let key = self.key().await?.ok_or(Error::Locked)?;
@@ -517,19 +542,29 @@ impl VaultClient {
             Some(Expected {
                 revision: expected_revision,
                 cursor: Some(expected_cursor),
+                pending: expected_pending,
             }),
         )
         .await
     }
-    pub async fn delete_record(&self, id: String, expected_revision: u64) -> Result<String, Error> {
+    pub async fn delete_record(
+        &self,
+        id: String,
+        expected_revision: u64,
+        expected_pending: Option<String>,
+    ) -> Result<String, Error> {
         nddev_device_sync_domain::ModuleId::new(&id).map_err(|_| Error::Invalid)?;
         let _permit = self.admitted()?;
         let lookup = id.clone();
         let entity = self
-            .local(move |journal| journal.entity("vault_record", &lookup))
+            .journal
+            .entity("vault_record", &lookup)
             .await?
             .ok_or(Error::Invalid)?;
-        if entity.conflicted || entity.revision != expected_revision {
+        if entity.conflicted
+            || entity.revision != expected_revision
+            || entity.pending_id != expected_pending
+        {
             return Err(Error::Busy);
         }
         let key = self.key().await?.ok_or(Error::Locked)?;
@@ -545,6 +580,7 @@ impl VaultClient {
             Some(Expected {
                 revision: expected_revision,
                 cursor: None,
+                pending: expected_pending,
             }),
         )
         .await
@@ -587,7 +623,8 @@ impl VaultClient {
         let _permit = self.admitted()?;
         let key = self.key().await?.ok_or(Error::Locked)?;
         let entity = self
-            .local(move |journal| journal.entity("vault_record", &id))
+            .journal
+            .entity("vault_record", &id)
             .await?
             .ok_or(Error::Invalid)?;
         if entity.conflicted {
@@ -600,15 +637,23 @@ impl VaultClient {
         Ok(record.secret)
     }
     pub async fn synchronize(&self) -> Result<VaultView, Error> {
-        let _permit = self.admitted()?;
+        self.authorized()?;
+        let _permit = self
+            .sync_gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Busy)?;
         self.view
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .catching_up = true;
-        let result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-            self.ensure_key().await?;
-            self.synchronize_inner().await
-        })
+        let result = nddev_device_sync_accounts::runtime::timeout(
+            std::time::Duration::from_secs(60),
+            async {
+                self.ensure_key().await?;
+                self.synchronize_inner().await
+            },
+        )
         .await
         .map_err(dependency)
         .and_then(std::convert::identity);
@@ -624,8 +669,13 @@ impl VaultClient {
     /// Native callers provide actual observations, never presentation-authored
     /// DTOs. A bounded batch is encrypted/durable before network acknowledgement.
     pub async fn publish_states(&self, snapshots: Vec<Snapshot>) -> Result<VaultView, Error> {
-        let _permit = self.admitted()?;
-        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        self.authorized()?;
+        let _permit = self
+            .sync_gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Busy)?;
+        nddev_device_sync_accounts::runtime::timeout(std::time::Duration::from_secs(60), async {
             if snapshots.is_empty() || snapshots.len() > 32 {
                 return Err(Error::Invalid);
             }
@@ -654,9 +704,7 @@ impl VaultClient {
                     return Err(Error::Invalid);
                 }
                 let lookup_id = id.clone();
-                let previous = self
-                    .local(move |journal| journal.entity(kind.as_str(), &lookup_id))
-                    .await?;
+                let previous = self.journal.entity(kind.as_str(), &lookup_id).await?;
                 if let Some(previous) = previous {
                     let wire: wire::SyncOperation =
                         serde_json::from_slice(&previous.body).map_err(dependency)?;
@@ -696,9 +744,7 @@ impl VaultClient {
             }
             Some((kind.to_owned(), id.to_owned()))
         };
-        let mut entries = self
-            .local(move |journal| journal.state_page(cursor))
-            .await?;
+        let mut entries = self.journal.state_page(cursor).await?;
         let has_more = entries.len() > 50;
         entries.truncate(50);
         let next_after = entries
@@ -809,7 +855,7 @@ impl VaultClient {
             .unwrap_or_else(|e| e.into_inner())
             .catching_up = true;
         let key = self.key().await?.ok_or(Error::Locked)?;
-        for pending in self.local(Journal::pending).await? {
+        for pending in self.journal.pending().await? {
             let operation: wire::SyncOperation =
                 serde_json::from_slice(&pending.body).map_err(|_| Error::Invalid)?;
             let resolved = self.verify_operation(&key, &operation)?;
@@ -817,16 +863,18 @@ impl VaultClient {
                 .identity
                 .sync_request(SyncRequest::Append(pending.body))
                 .await
-                .map_err(dependency)?;
+                .map_err(identity_failure)?;
             if !matches!(result.status, 201 | 409) {
                 return Err(Error::Invalid);
             }
-            self.local(move |journal| journal.acknowledge(&pending.id, &result.body, resolved))
+            self.journal
+                .acknowledge(pending.id, result.body, resolved)
                 .await?;
         }
         let mut more = true;
+        let mut observed_cursor = 0;
         for _ in 0..16 {
-            let cursor = self.local(Journal::cursor).await?;
+            let cursor = self.journal.cursor().await?;
             let result = self
                 .identity
                 .sync_request(SyncRequest::Page {
@@ -834,36 +882,38 @@ impl VaultClient {
                     limit: 2,
                 })
                 .await
-                .map_err(dependency)?;
+                .map_err(identity_failure)?;
             let page: wire::SyncPage =
                 serde_json::from_slice(&result.body).map_err(|_| Error::Invalid)?;
             more = page.has_more;
+            observed_cursor = page.next_after_seq.try_into().map_err(dependency)?;
             let resolutions = page
                 .entries
                 .iter()
                 .map(|entry| self.verify_operation(&key, &entry.operation))
                 .collect::<Result<Vec<_>, _>>()?;
-            self.local(move |journal| journal.ingest(&page, &resolutions))
-                .await?;
+            self.journal.ingest(page, resolutions).await?;
             if !more {
                 break;
             }
         }
-        let (pending, _, _) = self
-            .local(|journal| {
-                let (pending, conflicts) = journal.counts()?;
-                Ok((pending, conflicts, journal.cursor()?))
-            })
-            .await?;
+        let (pending, _, _, _, _) = self.journal.stats().await?;
+        let caught_up = if !more && pending == 0 {
+            self.journal
+                .caught_up(
+                    observed_cursor,
+                    time::OffsetDateTime::now_utc()
+                        .unix_timestamp()
+                        .try_into()
+                        .map_err(dependency)?,
+                )
+                .await?
+        } else {
+            false
+        };
         {
             let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
-            view.catching_up = more || pending > 0;
-            if !view.catching_up {
-                view.last_sync_at = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(dependency)?
-                    .as_secs();
-            }
+            view.catching_up = !caught_up;
         }
         self.update_view().await
     }
@@ -871,10 +921,7 @@ impl VaultClient {
 
 #[cfg(test)]
 fn now_ms() -> Result<u64, Error> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(dependency)?
-        .as_millis()
+    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
         .try_into()
         .map_err(dependency)
 }
@@ -905,7 +952,7 @@ fn key_registry(secret: &[u8]) -> Result<Vec<VaultKey>, Error> {
 
 fn scope(identity: &IdentityClient) -> Result<Scope, Error> {
     let view = identity.view();
-    if !view.authenticated || !view.session_verified || view.credential_revalidation_required {
+    if !view.authenticated || view.credential_revalidation_required {
         return Err(Error::Locked);
     }
     let device = view
@@ -924,6 +971,111 @@ fn scope(identity: &IdentityClient) -> Result<Scope, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn fixture_mode(receipt: &serde_json::Value, mode: &str) -> Result<(), Error> {
+        let path = std::env::var("NDS_FIXTURE_RECEIPT").map_err(dependency)?;
+        let control = receipt["control_file"].as_str().ok_or(Error::Invalid)?;
+        std::fs::write(
+            control,
+            serde_json::to_vec(&serde_json::json!({"mode":mode})).map_err(dependency)?,
+        )
+        .map_err(dependency)?;
+        tokio::time::timeout(std::time::Duration::from_secs(12), async {
+            loop {
+                let state: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).map_err(dependency)?)
+                        .map_err(dependency)?;
+                if state["status"] == if mode == "online" { "running" } else { mode } {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(dependency)?
+    }
+    async fn concurrent_offline_write(
+        identity: Arc<IdentityClient>,
+        directory: PathBuf,
+        receipt: &serde_json::Value,
+    ) -> Result<(), Error> {
+        let probe = Arc::new(VaultClient::new(identity.clone(), directory.clone()).await?);
+        fixture_mode(receipt, "offline").await?;
+        let result = async {
+            let address = receipt["base_url"]
+                .as_str()
+                .ok_or(Error::Invalid)?
+                .strip_prefix("http://")
+                .ok_or(Error::Invalid)?;
+            let listener = std::net::TcpListener::bind(address).map_err(dependency)?;
+            listener.set_nonblocking(true).map_err(dependency)?;
+            let (connected, accepted) = tokio::sync::oneshot::channel();
+            let (release, hold) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let connection = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(5))
+                        }
+                        Err(_) => return Err(Error::Unavailable),
+                    }
+                };
+                let _ = connected.send(());
+                let _ = hold.recv_timeout(std::time::Duration::from_secs(10));
+                drop(connection);
+                Ok(())
+            });
+            // Match the production coordinator's task boundary. The long
+            // acceptance future must not nest the HTTP poll stack inside its
+            // unrelated local-edit future on the test runner's thread.
+            let background = probe.clone();
+            let mut synchronization = tokio::spawn(async move { background.synchronize().await });
+            let outcome = async {
+                tokio::select! {
+                    _=&mut synchronization=>return Err(Error::Invalid),
+                    result=accepted=>result.map_err(dependency)?,
+                }
+                // The genuine network request remains unanswered, but local
+                // encryption/commit and read-your-writes have their own gate.
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    probe.save_record(
+                        Some("concurrent-offline".into()),
+                        0,
+                        None,
+                        "Offline during stalled sync".into(),
+                        String::new(),
+                        Zeroizing::new("PRIVATE_OFFLINE_CONCURRENT_VALUE".into()),
+                    ),
+                )
+                .await
+                .map_err(dependency)??;
+                let reopened = VaultClient::new(identity, directory).await?;
+                let page = reopened.records(String::new()).await?;
+                if page.items.len() != 1
+                    || page.items[0].title != "Offline during stalled sync"
+                    || page.items[0].pending_id.is_none()
+                {
+                    return Err(Error::Invalid);
+                }
+                Ok(())
+            }
+            .await;
+            synchronization.abort();
+            let _ = synchronization.await;
+            let _ = release.send(());
+            worker.join().map_err(dependency)??;
+            outcome
+        }
+        .await;
+        fixture_mode(receipt, "online").await?;
+        result
+    }
     #[tokio::test]
     #[ignore = "requires an owned PostgreSQL/Mailpit fixture and actual native credentials"]
     async fn actual_native_vault_outbox_backend_and_process_recreation() {
@@ -961,39 +1113,42 @@ mod tests {
             .filter_map(|message| message["ID"].as_str().map(str::to_owned))
             .collect();
         identity.request_email(owner.into(), "en").await.unwrap();
-        let code = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let messages: serde_json::Value = http
-                    .get(format!("{mailbox}/api/v1/messages"))
-                    .send()
-                    .await
-                    .unwrap()
-                    .json()
-                    .await
-                    .unwrap();
-                if let Some(id) = messages["messages"]
-                    .as_array()
-                    .and_then(|values| values.first())
-                    .and_then(|value| value["ID"].as_str())
-                    .filter(|id| !previous_ids.iter().any(|previous| previous == id))
-                {
-                    let message: serde_json::Value = http
-                        .get(format!("{mailbox}/api/v1/message/{id}"))
+        let code = nddev_device_sync_accounts::runtime::timeout(
+            std::time::Duration::from_secs(10),
+            async {
+                loop {
+                    let messages: serde_json::Value = http
+                        .get(format!("{mailbox}/api/v1/messages"))
                         .send()
                         .await
                         .unwrap()
                         .json()
                         .await
                         .unwrap();
-                    if let Some((_, suffix)) =
-                        message["Text"].as_str().unwrap().split_once("code: ")
+                    if let Some(id) = messages["messages"]
+                        .as_array()
+                        .and_then(|values| values.first())
+                        .and_then(|value| value["ID"].as_str())
+                        .filter(|id| !previous_ids.iter().any(|previous| previous == id))
                     {
-                        break suffix.chars().take(8).collect::<String>();
+                        let message: serde_json::Value = http
+                            .get(format!("{mailbox}/api/v1/message/{id}"))
+                            .send()
+                            .await
+                            .unwrap()
+                            .json()
+                            .await
+                            .unwrap();
+                        if let Some((_, suffix)) =
+                            message["Text"].as_str().unwrap().split_once("code: ")
+                        {
+                            break suffix.chars().take(8).collect::<String>();
+                        }
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        })
+            },
+        )
         .await
         .unwrap();
         identity.verify_email(code).await.unwrap();
@@ -1010,13 +1165,14 @@ mod tests {
         let outcome = async {
             let created = vault.refresh().await?;
             assert!(created.unlocked && created.cursor == 0);
+            Box::pin(concurrent_offline_write(identity.clone(),directory.join("concurrent-probe"),&receipt)).await?;
             let key = store.read().await.map_err(dependency)?.unwrap();
             let secret = "PRIVATE_ACTUAL_VAULT_VALUE";
             vault
                 .save_record(
                     Some("acceptance-record".into()),
                     0,
-                    "Acceptance record".into(),
+                    None, "Acceptance record".into(),
                     "test-user".into(),
                     Zeroizing::new(secret.into()),
                 )
@@ -1113,13 +1269,13 @@ mod tests {
                     .save_record(
                         Some(format!("catchup-{index}")),
                         0,
-                        format!("Record {index}"),
+                        None, format!("Record {index}"),
                         String::new(),
                         Zeroizing::new(uuid::Uuid::new_v4().to_string()),
                     )
                     .await?;
             }
-            let old_sync = vault.snapshot().last_sync_at;
+            let old_sync = vault.refresh_local().await?.last_sync_at;
             for _ in 0..2 {
                 let partial = vault.synchronize().await?;
                 assert!(partial.catching_up && partial.pending > 0);
@@ -1153,7 +1309,7 @@ mod tests {
             // recovers committed sequence without resetting any native key.
             let path=vault.journal.path_for_acceptance();
             let sqlite=rusqlite::Connection::open(&path).map_err(dependency)?;
-            sqlite.execute_batch("ALTER TABLE entities DROP COLUMN server_seq; UPDATE meta SET schema_version=1;").map_err(dependency)?;drop(sqlite);
+            sqlite.execute_batch("DROP VIEW local_entities; DROP INDEX outbox_unsent; DROP INDEX outbox_dispatched; DROP INDEX conflict_entity; ALTER TABLE outbox DROP COLUMN predecessor; ALTER TABLE outbox DROP COLUMN dispatched; ALTER TABLE meta DROP COLUMN last_sync_at; ALTER TABLE meta DROP COLUMN local_revision; ALTER TABLE entities DROP COLUMN server_seq; UPDATE meta SET schema_version=1;").map_err(dependency)?;drop(sqlite);
             let migrated=VaultClient::new(identity.clone(),directory.clone()).await?;
             assert!(matches!(migrated.clipboard().await,Err(Error::Busy)));
             let mut progress=migrated.synchronize().await?;while progress.catching_up{progress=migrated.synchronize().await?;}
@@ -1161,21 +1317,21 @@ mod tests {
             assert_eq!(migrated.clipboard().await?.unwrap().0.server_seq,38);
             // Two independent durable replicas retain competing edits. Both
             // deny native use until a revision/cursor-bound owner decision lands.
-            vault.save_record(Some("acceptance-record".into()), 1, "Server edit".into(), "test-user".into(), Zeroizing::new(secret.into())).await?;
-            fresh.save_record(Some("acceptance-record".into()), 1, "Competing edit".into(), "test-user".into(), Zeroizing::new("PRIVATE_COMPETING_VALUE".into())).await?;
+            vault.save_record(Some("acceptance-record".into()), 1, None, "Server edit".into(), "test-user".into(), Zeroizing::new(secret.into())).await?;
+            fresh.save_record(Some("acceptance-record".into()), 1, None, "Competing edit".into(), "test-user".into(), Zeroizing::new("PRIVATE_COMPETING_VALUE".into())).await?;
             vault.synchronize().await?; fresh.synchronize().await?; vault.synchronize().await?;
             assert!(matches!(vault.native_secret("acceptance-record".into()).await, Err(Error::Busy)));
             assert!(matches!(fresh.native_secret("acceptance-record".into()).await, Err(Error::Busy)));
             let record = fresh.records(String::new()).await?.items.into_iter().find(|record| record.id == "acceptance-record").unwrap();
             assert!(record.conflicted && record.conflict.as_ref().unwrap().title == "Competing edit");
-            assert!(matches!(fresh.resolve_record(record.id.clone(), record.revision - 1, record.observed_seq, false).await, Err(Error::Busy)));
-            assert!(matches!(fresh.resolve_record(record.id.clone(), record.revision, record.observed_seq - 1, false).await, Err(Error::Busy)));
-            fresh.resolve_record(record.id, record.revision, record.observed_seq, false).await?;
+            assert!(matches!(fresh.resolve_record(record.id.clone(), record.revision - 1, record.observed_seq, None, false).await, Err(Error::Busy)));
+            assert!(matches!(fresh.resolve_record(record.id.clone(), record.revision, record.observed_seq - 1, None, false).await, Err(Error::Busy)));
+            fresh.resolve_record(record.id, record.revision, record.observed_seq, None, false).await?;
             fresh.synchronize().await?; vault.synchronize().await?;
             assert_eq!(vault.snapshot().conflicts, 0); assert_eq!(fresh.snapshot().conflicts, 0);
             assert_eq!(vault.native_secret("acceptance-record".into()).await?.as_str(), secret);
             for index in 0..120 {
-                vault.save_record(Some(format!("bulk-{index:03}")), 0, format!("Page record {index}"), String::new(), Zeroizing::new("PRIVATE_PAGE_VALUE".into())).await?;
+                vault.save_record(Some(format!("bulk-{index:03}")), 0, None, format!("Page record {index}"), String::new(), Zeroizing::new("PRIVATE_PAGE_VALUE".into())).await?;
             }
             for _ in 0..16 { if !vault.synchronize().await?.catching_up { break; } }
             assert!(!vault.snapshot().catching_up);
@@ -1183,15 +1339,15 @@ mod tests {
             assert!(!fresh.snapshot().catching_up);
             // A stale edit of a deleted record must remain visible as a
             // resolvable conflict. Choosing it restores only that chosen value.
-            vault.delete_record("bulk-000".into(), 1).await?;
-            fresh.save_record(Some("bulk-000".into()), 1, "Restore chosen edit".into(), String::new(), Zeroizing::new("PRIVATE_RESTORED_VALUE".into())).await?;
+            vault.delete_record("bulk-000".into(), 1, None).await?;
+            fresh.save_record(Some("bulk-000".into()), 1, None, "Restore chosen edit".into(), String::new(), Zeroizing::new("PRIVATE_RESTORED_VALUE".into())).await?;
             vault.synchronize().await?; fresh.synchronize().await?;
             let record = fresh.records(String::new()).await?.items.into_iter().find(|record| record.id == "bulk-000").unwrap();
             assert!(record.deleted && record.conflicted);
-            fresh.resolve_record(record.id, record.revision, record.observed_seq, true).await?;
+            fresh.resolve_record(record.id, record.revision, record.observed_seq, None, true).await?;
             fresh.synchronize().await?; vault.synchronize().await?;
             assert_eq!(vault.native_secret("bulk-000".into()).await?.as_str(), "PRIVATE_RESTORED_VALUE");
-            for index in 1..=5 { vault.delete_record(format!("bulk-{index:03}"), 1).await?; }
+            for index in 1..=5 { vault.delete_record(format!("bulk-{index:03}"), 1, None).await?; }
             vault.synchronize().await?;
             let mut after = String::new(); let mut ids = std::collections::BTreeSet::new();
             for _ in 0..8 {
@@ -1206,8 +1362,8 @@ mod tests {
             // An authenticated but corrupt server record must not advance the
             // verified inbox cursor or freshness. This poisons only this owned
             // disposable server; production has no reset/repair bypass.
-            let cursor = vault.journal.cursor()?;
-            fresh.save_record(Some("before-invalid".into()), 0, "Valid preceding record".into(), String::new(), Zeroizing::new("PRIVATE_VALID_PREFIX".into())).await?;
+            let cursor = vault.journal.cursor().await?;
+            fresh.save_record(Some("before-invalid".into()), 0, None, "Valid preceding record".into(), String::new(), Zeroizing::new("PRIVATE_VALID_PREFIX".into())).await?;
             for _ in 0..16 { if !fresh.synchronize().await?.catching_up { break; } }
             assert!(!fresh.snapshot().catching_up);
             let native_key = vault.key().await?.unwrap();
@@ -1219,10 +1375,10 @@ mod tests {
             assert_eq!(accepted.status, 201);
             let freshness = vault.snapshot().last_sync_at;
             assert!(matches!(vault.synchronize().await, Err(Error::Authentication)));
-            assert_eq!(vault.journal.cursor()?, cursor);
+            assert_eq!(vault.journal.cursor().await?, cursor);
             assert_eq!(vault.snapshot().last_sync_at, freshness);
-            assert!(vault.journal.entity("vault_record", "invalid-authentication")?.is_none());
-            assert!(vault.journal.entity("vault_record", "before-invalid")?.is_none());
+            assert!(vault.journal.entity("vault_record", "invalid-authentication").await?.is_none());
+            assert!(vault.journal.entity("vault_record", "before-invalid").await?.is_none());
             assert_eq!(store.read().await.map_err(dependency)?.unwrap().as_slice(), key.as_slice());
             // Actual persisted SQLite bytes contain ciphertext, not native keys
             // or the record's plaintext. Native credentials use a separate store.
