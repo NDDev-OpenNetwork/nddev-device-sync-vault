@@ -3,6 +3,6 @@ name: nddev-device-sync-vault
 version: 0.0.1-alpha.5
 channel: alpha
 license: AGPL-3.0-only
-repository: NDDev-OpenNetwork/nddev-device-sync-vault
+repository: NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-vault
 standards_lock: standarts.lock
 platforms: [linux, macos, windows, android, ios, web]

@@ -4,7 +4,7 @@ version = "0.0.1-alpha.5"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
-repository = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-vault"
+repository = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-vault"
 
 [features]
 default = []
