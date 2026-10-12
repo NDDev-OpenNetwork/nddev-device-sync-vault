@@ -1814,7 +1814,7 @@ dependencies = [
 [[package]]
 name = "nddev-device-sync-accounts"
 version = "0.0.1-alpha.18"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git?rev=0eecf17971637ff9fb8fe234fb5e2869fc923235#0eecf17971637ff9fb8fe234fb5e2869fc923235"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git?rev=7fabebd60063e0f46c815d1ae979490399166d51#7fabebd60063e0f46c815d1ae979490399166d51"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
@@ -1880,7 +1880,7 @@ dependencies = [
 [[package]]
 name = "nddev-device-sync-telemetry"
 version = "0.0.1-alpha.7"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability?rev=683e53492f89d0577e1372534b0ae7dce37aff9b#683e53492f89d0577e1372534b0ae7dce37aff9b"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability?rev=4b8dfb54168db648f76fb39d2d0cfb1ba7133a9b#4b8dfb54168db648f76fb39d2d0cfb1ba7133a9b"
 dependencies = [
  "android_log-sys",
  "chrono",
