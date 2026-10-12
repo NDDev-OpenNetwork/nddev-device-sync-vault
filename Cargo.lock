@@ -1858,7 +1858,7 @@ dependencies = [
 [[package]]
 name = "nddev-device-sync-domain"
 version = "0.0.8"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git?rev=d5d16cc3f59aa879136c40d160e756d70c87b5da#d5d16cc3f59aa879136c40d160e756d70c87b5da"
+source = "git+https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git?rev=d5d16cc3f59aa879136c40d160e756d70c87b5da#d5d16cc3f59aa879136c40d160e756d70c87b5da"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -1869,7 +1869,7 @@ dependencies = [
 [[package]]
 name = "nddev-device-sync-http-signatures"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-protocol.git?rev=2d02bfca16266e7c343b024807362c7cbbf8f7c6#2d02bfca16266e7c343b024807362c7cbbf8f7c6"
+source = "git+https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-protocol.git?rev=2d02bfca16266e7c343b024807362c7cbbf8f7c6#2d02bfca16266e7c343b024807362c7cbbf8f7c6"
 dependencies = [
  "base64 0.22.1",
  "httpsig",
