@@ -1,0 +1,42 @@
+schema_version: 1
+repository:
+  id: "repo_01M4R3MH5582MDXZYYX6DMTY1B"
+  display_name: "nddev-device-sync-vault"
+  roles:
+    - "project"
+  lifecycle: "active"
+provider:
+  type: "github"
+  installation: "installation:github-nddev-technocracy-sandbox"
+  repository_id: 1413582930
+  owner: "NDDev-Technocracy-Sandbox"
+  name: "nddev-device-sync-vault"
+classification:
+  portfolios:
+    - "portfolio:nddev-opennetwork"
+  visibility_contract: "public"
+  data_classification: "public"
+product:
+  purpose: "Encrypted native and browser replica adapters for NDDev OpenNetwork, AGPL-3.0-only. AES-256-GCM binds ciphertext to owner, origin, entity, operation and revision; server-managed key provisioning under ADR 0006."
+  capabilities:
+    - "Authenticated AES-256-GCM record encryption with durable ciphertext queues"
+    - "Server-managed key provisioning via platform credential adapters and WebCrypto"
+policy:
+  profiles:
+    - "repository-default"
+    - "opennetwork-default"
+  rollout_ring: "standard"
+git:
+  default_branch: "main"
+  integration: "pull-request"
+  branch_model: "task-branches"
+  handoff_pr: "preferred"
+  cleanup: "merged-only"
+agent:
+  context_profile: "project-default"
+  generated_agents: false
+  serena:
+    enabled: false
+    provenance_required: false
+release:
+  mode: "none"
