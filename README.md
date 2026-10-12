@@ -47,5 +47,8 @@ to an older client.
 
 Browser qualification must exercise the actual composition root, credentials,
 worker restart, cross-tab writes and storage eviction/quota behavior. Browser
-profile storage may be evicted unless the browser grants persistence; local
+profile storage may be evicted unless the browser grants persistence. The client
+requests that preference at startup and reports the observed result; it never
+claims protection from explicit site-data removal. Admission allows at most
+four concurrent storage calls, with a 500 ms wait for the connection; local
 acknowledgement is a completed storage transaction, not a cloud acknowledgement.

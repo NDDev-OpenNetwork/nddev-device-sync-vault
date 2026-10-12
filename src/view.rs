@@ -11,6 +11,9 @@ pub struct VaultView {
     pub last_sync_at: u64,
     pub catching_up: bool,
     pub sync_error: String,
+    /// Browser retention preference observed at client startup; native is None.
+    /// Even persistent browser storage can be cleared explicitly by the user.
+    pub browser_persistent: Option<bool>,
 }
 #[derive(Clone)]
 pub struct ConflictView {

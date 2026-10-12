@@ -2,6 +2,24 @@
 // response deadlines. Worker death is an unknown outcome, never a fake receipt.
 let configuration, active, sequence=0, busy=false;
 const keyLeases=new Map();
+const waiters=[];
+function admit() {
+  if(!busy){busy=true;return Promise.resolve();}
+  if(waiters.length>=3)return Promise.reject(failed('vault_busy'));
+  return new Promise((resolve,reject)=>{
+    const entry={resolve:()=>{clearTimeout(entry.timer);resolve();}};
+    entry.timer=setTimeout(()=>{
+      const index=waiters.indexOf(entry);
+      if(index>=0)waiters.splice(index,1);
+      reject(failed('vault_busy'));
+    },500);
+    waiters.push(entry);
+  });
+}
+function release() {
+  const next=waiters.shift();
+  if(next)next.resolve();else busy=false;
+}
 function failed(code='vault_dependency_unavailable'){return new Error(code);}
 export function configureJournal(worker,module) {
   const urls=[worker,module].map(value=>new URL(value,location.href));
@@ -29,8 +47,9 @@ function message(worker,data) {
 }
 export async function journalRequest(scope,command) {
   if(!configuration||!/^[a-f0-9]{64}$/.test(scope)||command.length>8*1024*1024)throw failed();
-  if(busy)throw failed('vault_busy');
-  busy=true;
+  // Foreground reads/mutations and sync share one worker. Bound the queue
+  // and waiting time instead of spuriously failing every overlapping call.
+  await admit();
   try {
     if(!active||active.scope!==scope) {
       active?.worker.terminate();
@@ -40,7 +59,7 @@ export async function journalRequest(scope,command) {
       catch(error){worker.terminate();active=undefined;throw error;}
     }
     return await message(active.worker,{action:'execute',command});
-  } finally {busy=false;}
+  } finally {release();}
 }
 export function releaseKey(id) {const lease=keyLeases.get(id);if(lease){keyLeases.delete(id);lease.controller.abort();lease.release();}}
 export function acquireKey(id,scope) {
@@ -54,4 +73,15 @@ export function acquireKey(id,scope) {
     }).catch(()=>{if(keyLeases.get(id)===lease)keyLeases.delete(id);release();reject(failed('vault_busy'));});
     held.then(()=>clearTimeout(timer));
   });
+}
+
+// This is a browser retention preference, not a backup or a promise that the
+// user cannot clear site data. Request once per client and report the result.
+export async function requestPersistence() {
+  try {
+    if(!navigator.storage?.persisted||!navigator.storage?.persist)return false;
+    if(await navigator.storage.persisted())return true;
+    await navigator.storage.persist();
+    return await navigator.storage.persisted();
+  } catch {return false;}
 }

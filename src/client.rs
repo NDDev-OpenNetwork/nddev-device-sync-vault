@@ -64,6 +64,19 @@ impl VaultClient {
             expected_key: Mutex::default(),
         };
         client.update_view().await?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let persistent = crate::browser::request_persistence().await;
+            client
+                .view
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .browser_persistent = Some(persistent);
+            tracing::event!(target:"nddev_device_sync_vault",tracing::Level::INFO,{
+                event.name="vault.storage.persistence",module="vault",scope="io",
+                outcome=if persistent {"accepted"} else {"unavailable"}
+            });
+        }
         {
             let mut view = client.view.lock().unwrap_or_else(|e| e.into_inner());
             view.catching_up = view.pending > 0 || view.last_sync_at == 0;

@@ -18,6 +18,8 @@ extern "C" {
     fn call(scope: &str, command: &str) -> Result<js_sys::Promise, JsValue>;
     #[wasm_bindgen(catch,js_name=acquireKey)]
     fn acquire_key(id: &str, scope: &str) -> Result<js_sys::Promise, JsValue>;
+    #[wasm_bindgen(catch,js_name=requestPersistence)]
+    fn request_persistence_js() -> Result<js_sys::Promise, JsValue>;
     #[wasm_bindgen(js_name=releaseKey)]
     fn release_key(id: &str);
 }
@@ -34,6 +36,21 @@ fn failure(value: JsValue) -> Error {
 }
 pub fn configure_worker(worker_url: &str, module_url: &str) -> Result<(), Error> {
     configure(worker_url, module_url).map_err(failure)
+}
+pub(crate) async fn request_persistence() -> bool {
+    let Ok(promise) = request_persistence_js() else {
+        return false;
+    };
+    // Permission UI may remain open; do not hold vault startup indefinitely.
+    nddev_device_sync_accounts::runtime::timeout(
+        std::time::Duration::from_secs(5),
+        JsFuture::from(promise),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .and_then(|value| value.as_bool())
+    .unwrap_or(false)
 }
 pub(crate) async fn request(scope: &str, command: Command) -> Result<Reply, Error> {
     let command = serde_json::to_string(&command).map_err(|_| Error::Invalid)?;

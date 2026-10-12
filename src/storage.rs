@@ -147,6 +147,7 @@ pub(crate) struct Storage {
     #[cfg(target_arch = "wasm32")]
     scope: String,
     io: Arc<Semaphore>,
+    admission: Arc<Semaphore>,
 }
 impl Storage {
     pub async fn open(path: PathBuf) -> Result<Self, Error> {
@@ -158,6 +159,7 @@ impl Storage {
             Ok(Self {
                 journal,
                 io: Arc::new(Semaphore::new(1)),
+                admission: Arc::new(Semaphore::new(4)),
             })
         }
         #[cfg(target_arch = "wasm32")]
@@ -171,6 +173,7 @@ impl Storage {
             Ok(Self {
                 scope,
                 io: Arc::new(Semaphore::new(1)),
+                admission: Arc::new(Semaphore::new(4)),
             })
         }
     }
@@ -179,16 +182,27 @@ impl Storage {
         let span = nddev_device_sync_telemetry::operation_span("vault", "io")
             .map_err(|_| Error::Unavailable)?;
         let started = nddev_device_sync_accounts::runtime::Instant::now();
-        let permit = self
-            .io
+        // Local UI and synchronization share short transactions. Permit a
+        // bounded FIFO wait instead of rejecting a foreground call whenever a
+        // background read happens to own the connection. Both permits outlive
+        // a cancelled caller until actual native/worker I/O has completed.
+        let admission = self
+            .admission
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::Busy)?;
+        let permit = nddev_device_sync_accounts::runtime::timeout(
+            std::time::Duration::from_millis(500),
+            self.io.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| Error::Busy)?
+        .map_err(|_| Error::Unavailable)?;
         #[cfg(not(target_arch = "wasm32"))]
         {
             let journal = self.journal.clone();
             tokio::task::spawn_blocking(move || {
-                let _permit = permit;
+                let _permits = (permit, admission);
                 span.in_scope(|| {
                     let result = execute(&journal, command);
                     completed(event, started, &result);
@@ -207,7 +221,7 @@ impl Storage {
             // completion even if the presentation cancels its waiting future.
             nddev_device_sync_accounts::runtime::spawn(
                 async move {
-                    let _permit = permit;
+                    let _permits = (permit, admission);
                     let result = crate::browser::request(&scope, command).await;
                     completed(event, started, &result);
                     let _ = send.send(result);
