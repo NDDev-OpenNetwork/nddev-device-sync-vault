@@ -21,8 +21,8 @@ tracing = "0.1"
 nddev-device-sync-telemetry = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability", rev = "f3a7c16d0df0f0dc3912284db2e97d6894aaf5a0" }
 time = { version = "0.3", features = ["wasm-bindgen"] }
 uuid = { version = "1.27", features = ["v4"] }
-nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "fbe50f9994dde44f26ba803ac82c5d2ecfa1cacd" }
-nddev-device-sync-accounts = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git", rev = "1a2266342f2a981ffbd3de9bc9219549d3e5bf54" }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "d5d16cc3f59aa879136c40d160e756d70c87b5da" }
+nddev-device-sync-accounts = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git", rev = "b9c1b4c3756f2a5976c5f3aaf6371901a627fa3e" }
 
 tokio = { version = "1.53", features = ["rt", "sync", "time"] }
 sha2 = "0.10"
