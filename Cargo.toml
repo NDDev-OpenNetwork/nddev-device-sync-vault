@@ -18,11 +18,11 @@ serde_json = "1"
 zeroize = { version = "1.8", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
-nddev-device-sync-telemetry = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability", rev = "77e7e3ece9ac5aff400ce7a0880e52503b5ee41c" }
+nddev-device-sync-telemetry = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-observability", rev = "683e53492f89d0577e1372534b0ae7dce37aff9b" }
 time = { version = "0.3", features = ["wasm-bindgen"] }
 uuid = { version = "1.27", features = ["v4"] }
 nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "d5d16cc3f59aa879136c40d160e756d70c87b5da" }
-nddev-device-sync-accounts = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git", rev = "eeb6e947f5c10d1cf179f5a94ef7ad7b23942680" }
+nddev-device-sync-accounts = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-accounts.git", rev = "0eecf17971637ff9fb8fe234fb5e2869fc923235" }
 
 tokio = { version = "1.53", features = ["rt", "sync", "time"] }
 sha2 = "0.10"
