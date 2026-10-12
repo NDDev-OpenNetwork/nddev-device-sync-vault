@@ -7,9 +7,9 @@ repository:
   lifecycle: "active"
 provider:
   type: "github"
-  installation: "installation:github-opennetwork"
+  installation: "installation:github-nddev-technocracy-opennetwork-nds"
   repository_id: 1413582930
-  owner: "NDDev-OpenNetwork"
+  owner: "NDDev-Technocracy-OpenNetwork-NDS"
   name: "nddev-device-sync-vault"
 classification:
   portfolios:
