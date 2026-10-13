@@ -85,6 +85,8 @@ pub enum VaultError {
     Busy,
     #[error("vault_storage_full")]
     StorageFull,
+    #[error("sync_capacity_exhausted")]
+    CapacityExhausted,
     #[error("vault_key_registration_required")]
     RegistrationRequired,
 }
