@@ -1813,8 +1813,8 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-accounts"
-version = "0.0.1-alpha.18"
-source = "git+https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts.git?rev=6c666a90e5951931cd9a4d5c5975b160c17571ca#6c666a90e5951931cd9a4d5c5975b160c17571ca"
+version = "0.0.1-alpha.19"
+source = "git+https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts.git?rev=99d504db29326dc9148857a55526332c50c12354#99d504db29326dc9148857a55526332c50c12354"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
@@ -1856,9 +1856,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nddev-device-sync-application"
+version = "0.0.1-alpha.17"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git?rev=61daab3363fb74b54b2d55e34fad968fb8594421#61daab3363fb74b54b2d55e34fad968fb8594421"
+dependencies = [
+ "nddev-device-sync-domain",
+]
+
+[[package]]
 name = "nddev-device-sync-domain"
-version = "0.0.8"
-source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git?rev=d5d16cc3f59aa879136c40d160e756d70c87b5da#d5d16cc3f59aa879136c40d160e756d70c87b5da"
+version = "0.0.9"
+source = "git+https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git?rev=61daab3363fb74b54b2d55e34fad968fb8594421#61daab3363fb74b54b2d55e34fad968fb8594421"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -1879,8 +1887,8 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-telemetry"
-version = "0.0.1-alpha.8"
-source = "git+https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability?rev=e4eb0c57df475eaea3769b995a7e8343cb3a55b5#e4eb0c57df475eaea3769b995a7e8343cb3a55b5"
+version = "0.0.1-alpha.9"
+source = "git+https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability?rev=bb019a4b78f9a921c72e445c7e1ff5c0fe9c24ea#bb019a4b78f9a921c72e445c7e1ff5c0fe9c24ea"
 dependencies = [
  "android_log-sys",
  "chrono",
@@ -1906,12 +1914,13 @@ dependencies = [
 
 [[package]]
 name = "nddev-device-sync-vault"
-version = "0.0.1-alpha.6"
+version = "0.0.1-alpha.7"
 dependencies = [
  "base64 0.22.1",
  "js-sys",
  "libc",
  "nddev-device-sync-accounts",
+ "nddev-device-sync-application",
  "nddev-device-sync-domain",
  "nddev-device-sync-telemetry",
  "reqwest",

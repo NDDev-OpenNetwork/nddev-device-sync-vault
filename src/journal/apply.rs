@@ -2,8 +2,11 @@ use super::*;
 
 pub(super) fn same_operation(body: &[u8], operation: &wire::SyncOperation) -> Result<bool, Error> {
     let stored: wire::SyncOperation = serde_json::from_slice(body).map_err(|_| Error::Invalid)?;
-    Ok(serde_json::to_vec(&stored).map_err(failed)?
-        == serde_json::to_vec(operation).map_err(failed)?)
+    Ok(crate::codec::operation(&stored, body.len())?
+        == crate::codec::operation(
+            operation,
+            serde_json::to_vec(operation).map_err(failed)?.len(),
+        )?)
 }
 
 pub(super) fn kind(kind: &wire::EntityType) -> &'static str {
@@ -23,15 +26,12 @@ pub(super) fn apply(
     result: &[u8],
     resolved: u64,
 ) -> Result<(), Error> {
-    crate::codec::operation(operation, body.len())?;
+    let validated = crate::codec::operation(operation, body.len())?;
+    crate::codec::receipt(outcome)?.validate_for(&validated)?;
     let kind = kind(&operation.entity_type);
     match outcome {
         wire::Sync::Applied(value) => {
-            if value.operation_id != operation.operation_id
-                || value.revision != operation.base_revision + 1
-                || value.server_seq < 1
-                || resolved >= value.server_seq as u64
-            {
+            if resolved >= value.server_seq as u64 {
                 return Err(Error::Invalid);
             }
             tx.execute("INSERT INTO entities(kind,id,revision,body,server_seq) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(kind,id) DO UPDATE SET revision=EXCLUDED.revision,body=EXCLUDED.body,server_seq=EXCLUDED.server_seq WHERE entities.revision<EXCLUDED.revision OR (entities.revision=EXCLUDED.revision AND entities.body=EXCLUDED.body AND entities.server_seq=0)",params![kind,operation.entity_id,value.revision,body,value.server_seq]).map_err(sql_failed)?;
@@ -42,14 +42,7 @@ pub(super) fn apply(
                 tx.execute("DELETE FROM conflicts WHERE kind=?1 AND entity_id=?2 AND json_extract(CAST(result AS TEXT),'$.server_seq')<=?3", params![kind,operation.entity_id,resolved]).map_err(sql_failed)?;
             }
         }
-        wire::Sync::Conflict(value) => {
-            if value.operation_id != operation.operation_id
-                || value.base_revision != operation.base_revision
-                || value.current_revision < 0
-                || value.server_seq < 1
-            {
-                return Err(Error::Invalid);
-            }
+        wire::Sync::Conflict(_) => {
             // Owner scope is fixed by the replica; operation IDs are unique
             // only within one device. JSON tuple encoding is unambiguous even
             // when identifiers contain punctuation allowed by the protocol.
@@ -67,8 +60,7 @@ pub(super) fn apply(
                 let stored: wire::Sync =
                     serde_json::from_slice(&stored_result).map_err(|_| Error::Invalid)?;
                 if !same_operation(&stored_body, operation)?
-                    || serde_json::to_vec(&stored).map_err(failed)?
-                        != serde_json::to_vec(outcome).map_err(failed)?
+                    || crate::codec::receipt(&stored)? != crate::codec::receipt(outcome)?
                 {
                     return Err(Error::Invalid);
                 }

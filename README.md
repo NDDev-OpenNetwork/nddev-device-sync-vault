@@ -6,6 +6,11 @@ AES-256-GCM binds ciphertext to owner, origin, entity, operation and revision. A
 
 SQLite stores ciphertext, revisions, pending operations and explicit conflicts. A mutation is durable before local acknowledgement; network retries preserve exact bytes with fresh HTTP signatures. Inbox cursors advance in the same transaction as their retained entries. Queues, pages, storage and worker admission are bounded. Partial batches expose `catching_up`; only a fully caught-up observation advances `last_sync_at`.
 
+The core application owns the bounded replica reconciliation use case and pure
+request/receipt invariants. This adapter supplies authenticated transport,
+payload verification and whole journal transactions; it retains cryptography,
+key provisioning and SQLite/OPFS execution.
+
 Run `just check`. The ignored native acceptance requires an explicitly started isolated PostgreSQL/Mailpit fixture and unlocked native credential service; set `NDS_FIXTURE_RECEIPT` and run `just native-acceptance`. Host checks do not prove another platform's secure-store or UI behavior.
 
 Vault record lists use 50-entity keyset pages with explicit continuation, including

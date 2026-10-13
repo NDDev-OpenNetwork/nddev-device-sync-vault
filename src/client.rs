@@ -4,6 +4,7 @@ use crate::{
     storage::Storage,
 };
 use nddev_device_sync_accounts::{IdentityClient, SyncRequest, sync_wire as wire};
+use nddev_device_sync_application::replica::{self, ReplicaPort, VerifiedPage};
 use nddev_device_sync_domain::vault::Record;
 use nddev_device_sync_domain::{
     DeviceId,
@@ -461,7 +462,7 @@ impl VaultClient {
                     let wire: wire::SyncOperation =
                         serde_json::from_slice(&body).map_err(|_| Error::Invalid)?;
                     let record = self.decode_record(&key, &body)?;
-                    Ok(crate::view::ConflictView {
+                    Ok::<_, Error>(crate::view::ConflictView {
                         title: record.title,
                         username: record.username,
                         device_id: wire.device_id,
@@ -647,13 +648,10 @@ impl VaultClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .catching_up = true;
-        let result = nddev_device_sync_accounts::runtime::timeout(
-            std::time::Duration::from_secs(60),
-            async {
-                self.ensure_key().await?;
-                self.synchronize_inner().await
-            },
-        )
+        let result = nddev_device_sync_accounts::runtime::timeout(replica::BATCH_DEADLINE, async {
+            self.ensure_key().await?;
+            self.synchronize_inner().await
+        })
         .await
         .map_err(dependency)
         .and_then(std::convert::identity);
@@ -675,7 +673,7 @@ impl VaultClient {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::Busy)?;
-        nddev_device_sync_accounts::runtime::timeout(std::time::Duration::from_secs(60), async {
+        nddev_device_sync_accounts::runtime::timeout(replica::BATCH_DEADLINE, async {
             if snapshots.is_empty() || snapshots.len() > 32 {
                 return Err(Error::Invalid);
             }
@@ -855,67 +853,110 @@ impl VaultClient {
             .unwrap_or_else(|e| e.into_inner())
             .catching_up = true;
         let key = self.key().await?.ok_or(Error::Locked)?;
-        for pending in self.journal.pending().await? {
-            let operation: wire::SyncOperation =
-                serde_json::from_slice(&pending.body).map_err(|_| Error::Invalid)?;
-            let resolved = self.verify_operation(&key, &operation)?;
-            let result = self
-                .identity
-                .sync_request(SyncRequest::Append(pending.body.clone()))
-                .await
-                .map_err(identity_failure)?;
-            if !matches!(result.status, 201 | 409) {
-                return Err(Error::Invalid);
-            }
-            self.journal
-                .acknowledge(pending.body, result.body, resolved)
-                .await?;
-        }
-        let mut more = true;
-        let mut observed_cursor = 0;
-        for _ in 0..16 {
-            let cursor = self.journal.cursor().await?;
-            let result = self
-                .identity
-                .sync_request(SyncRequest::Page {
-                    after: cursor,
-                    limit: 2,
-                })
-                .await
-                .map_err(identity_failure)?;
-            let page: wire::SyncPage =
-                serde_json::from_slice(&result.body).map_err(|_| Error::Invalid)?;
-            more = page.has_more;
-            observed_cursor = page.next_after_seq.try_into().map_err(dependency)?;
-            let resolutions = page
-                .entries
-                .iter()
-                .map(|entry| self.verify_operation(&key, &entry.operation))
-                .collect::<Result<Vec<_>, _>>()?;
-            self.journal.ingest(page, resolutions).await?;
-            if !more {
-                break;
-            }
-        }
-        let (pending, _, _, _, _) = self.journal.stats().await?;
-        let caught_up = if !more && pending == 0 {
-            self.journal
-                .caught_up(
-                    observed_cursor,
-                    time::OffsetDateTime::now_utc()
-                        .unix_timestamp()
-                        .try_into()
-                        .map_err(dependency)?,
-                )
-                .await?
-        } else {
-            false
-        };
-        {
-            let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
-            view.catching_up = !caught_up;
-        }
+        let progress = replica::reconcile(&Replica { client: self, key }).await?;
+        self.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .catching_up = !progress.caught_up;
         self.update_view().await
+    }
+}
+
+// Concrete wire/crypto/storage composition for the shared application use case.
+struct Replica<'a> {
+    client: &'a VaultClient,
+    key: VaultKey,
+}
+impl From<nddev_device_sync_domain::sync::SyncError> for Error {
+    fn from(error: nddev_device_sync_domain::sync::SyncError) -> Self {
+        use nddev_device_sync_domain::sync::SyncError;
+        match error {
+            SyncError::Denied | SyncError::Revoked => Self::Locked,
+            SyncError::Unavailable => Self::Unavailable,
+            SyncError::Capacity => Self::Busy,
+            SyncError::KeyRegistration => Self::RegistrationRequired,
+            _ => Self::Invalid,
+        }
+    }
+}
+impl ReplicaPort for Replica<'_> {
+    type Error = Error;
+    type Pending = crate::journal::Pending;
+    type Receipt = (Vec<u8>, u64);
+    type Page = (wire::SyncPage, Vec<u64>);
+
+    async fn claim(&self) -> Result<Vec<Self::Pending>, Error> {
+        self.client.journal.pending().await
+    }
+    async fn append(&self, pending: &Self::Pending) -> Result<Self::Receipt, Error> {
+        let operation = serde_json::from_slice(&pending.body).map_err(|_| Error::Invalid)?;
+        let resolved = self.client.verify_operation(&self.key, &operation)?;
+        let result = self
+            .client
+            .identity
+            .sync_request(SyncRequest::Append(pending.body.clone()))
+            .await
+            .map_err(identity_failure)?;
+        if !matches!(result.status, 201 | 409) {
+            return Err(Error::Invalid);
+        }
+        Ok((result.body, resolved))
+    }
+    async fn acknowledge(
+        &self,
+        pending: Self::Pending,
+        receipt: Self::Receipt,
+    ) -> Result<(), Error> {
+        self.client
+            .journal
+            .acknowledge(pending.body, receipt.0, receipt.1)
+            .await
+    }
+    async fn cursor(&self) -> Result<u64, Error> {
+        self.client.journal.cursor().await
+    }
+    async fn verified_page(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<VerifiedPage<Self::Page>, Error> {
+        let result = self
+            .client
+            .identity
+            .sync_request(SyncRequest::Page {
+                after,
+                limit: limit.try_into().map_err(|_| Error::Invalid)?,
+            })
+            .await
+            .map_err(identity_failure)?;
+        let page: wire::SyncPage =
+            serde_json::from_slice(&result.body).map_err(|_| Error::Invalid)?;
+        let resolutions = page
+            .entries
+            .iter()
+            .map(|entry| self.client.verify_operation(&self.key, &entry.operation))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(VerifiedPage {
+            next_after: page.next_after_seq.try_into().map_err(|_| Error::Invalid)?,
+            entries: page.entries.len(),
+            has_more: page.has_more,
+            contents: (page, resolutions),
+        })
+    }
+    async fn ingest(&self, (page, resolutions): Self::Page) -> Result<(), Error> {
+        self.client.journal.ingest(page, resolutions).await
+    }
+    async fn caught_up(&self, cursor: u64) -> Result<bool, Error> {
+        self.client
+            .journal
+            .caught_up(
+                cursor,
+                time::OffsetDateTime::now_utc()
+                    .unix_timestamp()
+                    .try_into()
+                    .map_err(|_| Error::Invalid)?,
+            )
+            .await
     }
 }
 
@@ -1076,9 +1117,7 @@ mod tests {
         fixture_mode(receipt, "online").await?;
         result
     }
-    #[tokio::test]
-    #[ignore = "requires an owned PostgreSQL/Mailpit fixture and actual native credentials"]
-    async fn actual_native_vault_outbox_backend_and_process_recreation() {
+    async fn fixture_identity() -> (serde_json::Value, Arc<IdentityClient>) {
         let receipt: serde_json::Value = serde_json::from_slice(
             &std::fs::read(std::env::var("NDS_FIXTURE_RECEIPT").unwrap()).unwrap(),
         )
@@ -1086,11 +1125,13 @@ mod tests {
         let endpoint = receipt["base_url"].as_str().unwrap();
         let mailbox = receipt["mailpit_url"].as_str().unwrap();
         let owner = receipt["owner_email"].as_str().unwrap();
-        assert!(
-            endpoint.starts_with("http://127.0.0.1:")
-                && mailbox.starts_with("http://127.0.0.1:")
-                && owner.ends_with(".invalid")
-        );
+        for value in [endpoint, mailbox] {
+            let url = reqwest::Url::parse(value).unwrap();
+            assert_eq!(url.scheme(), "http");
+            assert!(matches!(url.host_str(), Some("127.0.0.1" | "localhost")));
+            assert!(url.port().is_some());
+        }
+        assert!(owner.ends_with(".invalid"));
         let identity = Arc::new(IdentityClient::new(endpoint).unwrap());
         identity.refresh().await.unwrap();
         let http = reqwest::Client::builder()
@@ -1156,6 +1197,13 @@ mod tests {
             .enroll_device("Native vault acceptance".into())
             .await
             .unwrap();
+        (receipt, identity)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an owned PostgreSQL/Mailpit fixture and actual native credentials"]
+    async fn actual_native_vault_outbox_backend_and_process_recreation() {
+        let (receipt, identity) = fixture_identity().await;
         let directory =
             std::env::temp_dir().join(format!("nds-vault-acceptance-{}", uuid::Uuid::new_v4()));
         let vault = VaultClient::new(identity.clone(), directory.clone())
@@ -1262,8 +1310,9 @@ mod tests {
                 store.read().await.map_err(dependency)?.unwrap().as_slice(),
                 key.as_slice()
             );
-            // Real ciphertext writes exceed one bounded catch-up batch. A fresh
-            // replica must report partial progress without advancing freshness.
+            // Large real ciphertext entries exceed one byte-bounded catch-up
+            // batch even when the server permits 100 small entries per page.
+            // A partial observation must not advance durable freshness.
             for index in 0..33 {
                 vault
                     .save_record(
@@ -1271,7 +1320,7 @@ mod tests {
                         0,
                         None, format!("Record {index}"),
                         String::new(),
-                        Zeroizing::new(uuid::Uuid::new_v4().to_string()),
+                        Zeroizing::new("x".repeat(16_000)),
                     )
                     .await?;
             }
@@ -1284,7 +1333,7 @@ mod tests {
             assert!(!vault.synchronize().await?.catching_up);
             let fresh = VaultClient::new(identity.clone(), directory.join("fresh-replica")).await?;
             let partial = fresh.refresh().await?;
-            assert!(partial.catching_up && partial.cursor == 32);
+            assert!(partial.catching_up && partial.cursor > 0 && partial.cursor < 36);
             assert_eq!(partial.last_sync_at, 0);
             let complete = fresh.synchronize().await?;
             assert!(!complete.catching_up && complete.cursor == 36 && complete.last_sync_at > 0);
@@ -1400,6 +1449,99 @@ mod tests {
             vault.native_secret("acceptance-record".into()).await,
             Err(Error::Locked)
         ));
+        std::fs::remove_dir_all(directory).unwrap();
+        outcome.unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires an owned byte-bounded PostgreSQL/Mailpit fixture and actual native credentials"]
+    async fn actual_native_large_page_catchup_preserves_bounds_and_freshness() {
+        let (_receipt, identity) = fixture_identity().await;
+        let directory =
+            std::env::temp_dir().join(format!("nds-page-acceptance-{}", uuid::Uuid::new_v4()));
+        let vault = VaultClient::new(identity.clone(), directory.clone())
+            .await
+            .unwrap();
+        let store = identity.vault_credentials().unwrap();
+        let outcome = async {
+            assert_eq!(vault.refresh().await?.cursor, 0);
+            for index in 0..133 {
+                vault
+                    .save_record(
+                        Some(format!("page-record-{index:03}")),
+                        0,
+                        None,
+                        format!("Page record {index}"),
+                        String::new(),
+                        Zeroizing::new(if index < 33 {
+                            "x".repeat(16_000)
+                        } else {
+                            "synthetic".into()
+                        }),
+                    )
+                    .await?;
+            }
+            let mut writer = vault.snapshot();
+            for _ in 0..16 {
+                writer = vault.synchronize().await?;
+                if !writer.catching_up {
+                    break;
+                }
+            }
+            assert!(!writer.catching_up && writer.pending == 0 && writer.cursor == 133);
+
+            let large = identity
+                .sync_request(SyncRequest::Page {
+                    after: 0,
+                    limit: 100,
+                })
+                .await
+                .map_err(identity_failure)?;
+            assert!(large.body.len() <= nddev_device_sync_domain::sync::MAX_PAGE_BYTES);
+            let page: wire::SyncPage = serde_json::from_slice(&large.body).map_err(dependency)?;
+            assert_eq!(page.entries.len(), 2);
+            assert!(page.has_more && page.next_after_seq == 2);
+            let small = identity
+                .sync_request(SyncRequest::Page {
+                    after: 33,
+                    limit: 100,
+                })
+                .await
+                .map_err(identity_failure)?;
+            assert!(small.body.len() <= nddev_device_sync_domain::sync::MAX_PAGE_BYTES);
+            let page: wire::SyncPage = serde_json::from_slice(&small.body).map_err(dependency)?;
+            assert!(page.entries.len() > 2 && page.entries.len() <= 100);
+            assert_eq!(page.next_after_seq, 33 + page.entries.len() as i64);
+
+            let fresh = VaultClient::new(identity.clone(), directory.join("fresh-replica")).await?;
+            let partial = fresh.refresh().await?;
+            assert!(partial.catching_up && partial.cursor > 0 && partial.cursor < 133);
+            assert_eq!(partial.last_sync_at, 0);
+            let complete = fresh.synchronize().await?;
+            assert!(!complete.catching_up && complete.cursor == 133 && complete.last_sync_at > 0);
+            let mut after = String::new();
+            let mut seen = std::collections::BTreeSet::new();
+            loop {
+                let page = fresh.records(after).await?;
+                for item in page.items {
+                    assert_eq!(item.revision, 1);
+                    assert!(!item.conflicted && item.pending_id.is_none());
+                    assert!(seen.insert(item.id));
+                }
+                if !page.has_more {
+                    break;
+                }
+                after = page.next_after;
+            }
+            assert_eq!(seen.len(), 133);
+            assert_eq!(
+                fresh.native_secret("page-record-000".into()).await?.len(),
+                16_000
+            );
+            Ok::<_, Error>(())
+        }
+        .await;
+        store.delete().await.unwrap();
+        identity.logout().await.unwrap();
         std::fs::remove_dir_all(directory).unwrap();
         outcome.unwrap();
     }

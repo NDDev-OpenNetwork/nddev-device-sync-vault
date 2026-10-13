@@ -9,14 +9,17 @@ impl Journal {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_failed)?;
         let entries = {
-            let mut query=tx.prepare("SELECT id,body FROM outbox WHERE state='pending' AND predecessor IS NULL ORDER BY rowid LIMIT 16").map_err(sql_failed)?;
+            let mut query=tx.prepare("SELECT id,body FROM outbox WHERE state='pending' AND predecessor IS NULL ORDER BY rowid LIMIT ?1").map_err(sql_failed)?;
             query
-                .query_map([], |r| {
-                    Ok(Pending {
-                        id: r.get(0)?,
-                        body: r.get(1)?,
-                    })
-                })
+                .query_map(
+                    [nddev_device_sync_application::replica::MAX_UPLOADS as u32],
+                    |r| {
+                        Ok(Pending {
+                            id: r.get(0)?,
+                            body: r.get(1)?,
+                        })
+                    },
+                )
                 .map_err(sql_failed)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(sql_failed)?
