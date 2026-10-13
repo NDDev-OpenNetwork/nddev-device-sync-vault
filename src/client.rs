@@ -1358,7 +1358,7 @@ mod tests {
             // recovers committed sequence without resetting any native key.
             let path=vault.journal.path_for_acceptance();
             let sqlite=rusqlite::Connection::open(&path).map_err(dependency)?;
-            sqlite.execute_batch("DROP VIEW local_entities; DROP INDEX outbox_unsent; DROP INDEX outbox_dispatched; DROP INDEX conflict_entity; ALTER TABLE outbox DROP COLUMN predecessor; ALTER TABLE outbox DROP COLUMN dispatched; ALTER TABLE meta DROP COLUMN last_sync_at; ALTER TABLE meta DROP COLUMN local_revision; ALTER TABLE entities DROP COLUMN server_seq; UPDATE meta SET schema_version=1;").map_err(dependency)?;drop(sqlite);
+            sqlite.execute_batch("DROP VIEW local_entities; DROP VIEW meta; ALTER TABLE replica_meta RENAME TO meta; ALTER TABLE replica_outbox RENAME TO outbox; ALTER TABLE replica_entities RENAME TO entities; ALTER TABLE replica_conflicts RENAME TO conflicts; DROP INDEX outbox_unsent; DROP INDEX outbox_dispatched; DROP INDEX conflict_entity; ALTER TABLE outbox DROP COLUMN predecessor; ALTER TABLE outbox DROP COLUMN dispatched; ALTER TABLE meta DROP COLUMN last_sync_at; ALTER TABLE meta DROP COLUMN local_revision; ALTER TABLE entities DROP COLUMN server_seq; UPDATE meta SET schema_version=1;").map_err(dependency)?;drop(sqlite);
             let migrated=VaultClient::new(identity.clone(),directory.clone()).await?;
             assert!(matches!(migrated.clipboard().await,Err(Error::Busy)));
             let mut progress=migrated.synchronize().await?;while progress.catching_up{progress=migrated.synchronize().await?;}

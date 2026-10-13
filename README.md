@@ -54,6 +54,15 @@ checks every operation field, including the device. Stop older clients/tabs
 before upgrading their shared journal; do not downgrade it. The migration does
 not restore records previously discarded by an older client.
 
+Schema 6 atomically renames the private mutable tables, preserving rows, IDs,
+ciphertext, receipts, pending chains and cursors. A read-only legacy metadata
+view prevents old bootstrap from creating a parallel journal. Cached schema
+4/5 writers fail at the storage boundary; current reads and writes recheck the
+supported version inside their transaction. Unknown or uncertain stores fail
+closed. Browser commands continue to reopen the same Journal under their Web
+Lock; no second fencing layer is added. Upgrade all consumers together to remove
+old-client failures, and preserve active drafts while replacing old tabs.
+
 Browser qualification must exercise the actual composition root, credentials,
 worker restart, cross-tab writes and storage eviction/quota behavior. Browser
 profile storage may be evicted unless the browser grants persistence. The client

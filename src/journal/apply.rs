@@ -34,12 +34,12 @@ pub(super) fn apply(
             if resolved >= value.server_seq as u64 {
                 return Err(Error::Invalid);
             }
-            tx.execute("INSERT INTO entities(kind,id,revision,body,server_seq) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(kind,id) DO UPDATE SET revision=EXCLUDED.revision,body=EXCLUDED.body,server_seq=EXCLUDED.server_seq WHERE entities.revision<EXCLUDED.revision OR (entities.revision=EXCLUDED.revision AND entities.body=EXCLUDED.body AND entities.server_seq=0)",params![kind,operation.entity_id,value.revision,body,value.server_seq]).map_err(sql_failed)?;
+            tx.execute("INSERT INTO replica_entities(kind,id,revision,body,server_seq) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(kind,id) DO UPDATE SET revision=EXCLUDED.revision,body=EXCLUDED.body,server_seq=EXCLUDED.server_seq WHERE replica_entities.revision<EXCLUDED.revision OR (replica_entities.revision=EXCLUDED.revision AND replica_entities.body=EXCLUDED.body AND replica_entities.server_seq=0)",params![kind,operation.entity_id,value.revision,body,value.server_seq]).map_err(sql_failed)?;
             if resolved > 0 {
                 if kind != "vault_record" {
                     return Err(Error::Invalid);
                 }
-                tx.execute("DELETE FROM conflicts WHERE kind=?1 AND entity_id=?2 AND json_extract(CAST(result AS TEXT),'$.server_seq')<=?3", params![kind,operation.entity_id,resolved]).map_err(sql_failed)?;
+                tx.execute("DELETE FROM replica_conflicts WHERE kind=?1 AND entity_id=?2 AND json_extract(CAST(result AS TEXT),'$.server_seq')<=?3", params![kind,operation.entity_id,resolved]).map_err(sql_failed)?;
             }
         }
         wire::Sync::Conflict(_) => {
@@ -48,11 +48,11 @@ pub(super) fn apply(
             // when identifiers contain punctuation allowed by the protocol.
             let id = serde_json::to_string(&(&operation.device_id, &operation.operation_id))
                 .map_err(failed)?;
-            let inserted = tx.execute("INSERT OR IGNORE INTO conflicts(id,kind,entity_id,body,result) VALUES(?1,?2,?3,?4,?5)",params![id,kind,operation.entity_id,body,result]).map_err(sql_failed)?;
+            let inserted = tx.execute("INSERT OR IGNORE INTO replica_conflicts(id,kind,entity_id,body,result) VALUES(?1,?2,?3,?4,?5)",params![id,kind,operation.entity_id,body,result]).map_err(sql_failed)?;
             if inserted == 0 {
                 let (stored_body, stored_result): (Vec<u8>, Vec<u8>) = tx
                     .query_row(
-                        "SELECT body,result FROM conflicts WHERE id=?1",
+                        "SELECT body,result FROM replica_conflicts WHERE id=?1",
                         [&id],
                         |r| Ok((r.get(0)?, r.get(1)?)),
                     )
