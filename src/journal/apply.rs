@@ -1,5 +1,11 @@
 use super::*;
 
+pub(super) fn same_operation(body: &[u8], operation: &wire::SyncOperation) -> Result<bool, Error> {
+    let stored: wire::SyncOperation = serde_json::from_slice(body).map_err(|_| Error::Invalid)?;
+    Ok(serde_json::to_vec(&stored).map_err(failed)?
+        == serde_json::to_vec(operation).map_err(failed)?)
+}
+
 pub(super) fn kind(kind: &wire::EntityType) -> &'static str {
     match kind {
         wire::EntityType::AccountState => "account_state",
@@ -44,7 +50,29 @@ pub(super) fn apply(
             {
                 return Err(Error::Invalid);
             }
-            tx.execute("INSERT OR IGNORE INTO conflicts(id,kind,entity_id,body,result) VALUES(?1,?2,?3,?4,?5)",params![operation.operation_id,kind,operation.entity_id,body,result]).map_err(sql_failed)?;
+            // Owner scope is fixed by the replica; operation IDs are unique
+            // only within one device. JSON tuple encoding is unambiguous even
+            // when identifiers contain punctuation allowed by the protocol.
+            let id = serde_json::to_string(&(&operation.device_id, &operation.operation_id))
+                .map_err(failed)?;
+            let inserted = tx.execute("INSERT OR IGNORE INTO conflicts(id,kind,entity_id,body,result) VALUES(?1,?2,?3,?4,?5)",params![id,kind,operation.entity_id,body,result]).map_err(sql_failed)?;
+            if inserted == 0 {
+                let (stored_body, stored_result): (Vec<u8>, Vec<u8>) = tx
+                    .query_row(
+                        "SELECT body,result FROM conflicts WHERE id=?1",
+                        [&id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .map_err(sql_failed)?;
+                let stored: wire::Sync =
+                    serde_json::from_slice(&stored_result).map_err(|_| Error::Invalid)?;
+                if !same_operation(&stored_body, operation)?
+                    || serde_json::to_vec(&stored).map_err(failed)?
+                        != serde_json::to_vec(outcome).map_err(failed)?
+                {
+                    return Err(Error::Invalid);
+                }
+            }
         }
     }
     Ok(())
