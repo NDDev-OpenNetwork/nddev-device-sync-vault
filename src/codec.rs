@@ -70,3 +70,25 @@ pub fn body(value: &Operation) -> Result<Vec<u8>, Error> {
     value.validate(body.len()).map_err(|_| Error::Invalid)?;
     Ok(body)
 }
+
+/// Decode the generated receipt into the pure core invariant.
+pub fn receipt(value: &wire::Sync) -> Result<Receipt, Error> {
+    let integer = |value: i64| u64::try_from(value).map_err(|_| Error::Invalid);
+    Ok(match value {
+        wire::Sync::Applied(value) => Receipt {
+            operation_id: value.operation_id.clone(),
+            server_seq: integer(value.server_seq)?,
+            decision: Decision::Apply {
+                revision: integer(value.revision)?,
+            },
+        },
+        wire::Sync::Conflict(value) => Receipt {
+            operation_id: value.operation_id.clone(),
+            server_seq: integer(value.server_seq)?,
+            decision: Decision::Conflict {
+                base_revision: integer(value.base_revision)?,
+                current_revision: integer(value.current_revision)?,
+            },
+        },
+    })
+}

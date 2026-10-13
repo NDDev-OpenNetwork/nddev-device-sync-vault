@@ -7,6 +7,34 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use std::fs::{self, File, OpenOptions};
 use std::{path::PathBuf, time::Duration};
 
+const SCHEMA_VERSION: u32 = 6;
+
+fn check_version(connection: &Connection) -> Result<(), Error> {
+    let version: u32 = connection
+        .query_row(
+            "SELECT schema_version FROM replica_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_failed)?;
+    if version == SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(Error::Invalid)
+    }
+}
+
+fn transaction(
+    connection: &mut Connection,
+    behavior: TransactionBehavior,
+) -> Result<rusqlite::Transaction<'_>, Error> {
+    let tx = connection
+        .transaction_with_behavior(behavior)
+        .map_err(sql_failed)?;
+    check_version(&tx)?;
+    Ok(tx)
+}
+
 #[derive(Clone)]
 pub struct Journal {
     path: PathBuf,
@@ -120,6 +148,15 @@ impl Journal {
             .map_err(sql_failed)?;
         connection.execute_batch("PRAGMA synchronous=FULL; PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON; PRAGMA max_page_count=65536; PRAGMA wal_autocheckpoint=64; PRAGMA journal_size_limit=1048576;").map_err(sql_failed)?;
         Ok(connection)
+    }
+    /// Version and read model share one SQLite snapshot. The write helper checks
+    /// the same version under IMMEDIATE admission, serialized with migration.
+    fn read<T>(&self, work: impl FnOnce(&Connection) -> Result<T, Error>) -> Result<T, Error> {
+        let mut connection = self.connection()?;
+        let tx = transaction(&mut connection, TransactionBehavior::Deferred)?;
+        let result = work(&tx)?;
+        tx.commit().map_err(sql_failed)?;
+        Ok(result)
     }
     /// Held across native key creation/import. The OS lock serializes independent
     /// app processes too; an in-process semaphore alone cannot protect a key.

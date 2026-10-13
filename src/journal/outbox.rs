@@ -5,18 +5,19 @@ impl Journal {
     /// same bytes; successors cannot be sent until the predecessor is applied.
     pub fn pending(&self) -> Result<Vec<Pending>, Error> {
         let mut connection = self.connection()?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_failed)?;
+        let tx = transaction(&mut connection, TransactionBehavior::Immediate)?;
         let entries = {
-            let mut query=tx.prepare("SELECT id,body FROM outbox WHERE state='pending' AND predecessor IS NULL ORDER BY rowid LIMIT 16").map_err(sql_failed)?;
+            let mut query=tx.prepare("SELECT id,body FROM replica_outbox WHERE state='pending' AND predecessor IS NULL ORDER BY rowid LIMIT ?1").map_err(sql_failed)?;
             query
-                .query_map([], |r| {
-                    Ok(Pending {
-                        id: r.get(0)?,
-                        body: r.get(1)?,
-                    })
-                })
+                .query_map(
+                    [nddev_device_sync_application::replica::MAX_UPLOADS as u32],
+                    |r| {
+                        Ok(Pending {
+                            id: r.get(0)?,
+                            body: r.get(1)?,
+                        })
+                    },
+                )
                 .map_err(sql_failed)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(sql_failed)?
@@ -25,7 +26,7 @@ impl Journal {
         for entry in &entries {
             changed += tx
                 .execute(
-                    "UPDATE outbox SET dispatched=1 WHERE id=?1 AND dispatched=0",
+                    "UPDATE replica_outbox SET dispatched=1 WHERE id=?1 AND dispatched=0",
                     [&entry.id],
                 )
                 .map_err(sql_failed)?;
@@ -51,9 +52,7 @@ impl Journal {
         crate::codec::operation(&operation, body.len())?;
         let kind = kind(&operation.entity_type);
         let mut connection = self.connection()?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_failed)?;
+        let tx = transaction(&mut connection, TransactionBehavior::Immediate)?;
         let entity = reads::entity(&tx, kind, &operation.entity_id)?;
         let revision = entity.as_ref().map_or(0, |e| e.revision);
         let pending = entity.as_ref().and_then(|e| e.pending_id.clone());
@@ -67,9 +66,11 @@ impl Journal {
         }
         if let Some(expected) = expected_cursor {
             let actual: u64 = tx
-                .query_row("SELECT cursor FROM meta WHERE singleton=1", [], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT cursor FROM replica_meta WHERE singleton=1",
+                    [],
+                    |r| r.get(0),
+                )
                 .map_err(sql_failed)?;
             if actual != expected
                 || kind != "vault_record"
@@ -79,17 +80,17 @@ impl Journal {
             }
             // An unacknowledged dispatched operation is still immutable. The
             // user must observe its server outcome before resolving the family.
-            let in_flight:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE kind=?1 AND entity_id=?2 AND dispatched=1)",params![kind,operation.entity_id],|r|r.get(0)).map_err(sql_failed)?;
+            let in_flight:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM replica_outbox WHERE kind=?1 AND entity_id=?2 AND dispatched=1)",params![kind,operation.entity_id],|r|r.get(0)).map_err(sql_failed)?;
             if in_flight {
                 return Err(Error::Busy);
             }
         } else if entity.as_ref().is_some_and(|e| e.conflicted) {
             return Err(Error::Busy);
         }
-        let old:Option<(String,u32,Option<String>)>=tx.query_row("SELECT id,dispatched,predecessor FROM outbox WHERE kind=?1 AND entity_id=?2 ORDER BY rowid DESC LIMIT 1",params![kind,operation.entity_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(sql_failed)?;
+        let old:Option<(String,u32,Option<String>)>=tx.query_row("SELECT id,dispatched,predecessor FROM replica_outbox WHERE kind=?1 AND entity_id=?2 ORDER BY rowid DESC LIMIT 1",params![kind,operation.entity_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(sql_failed)?;
         let predecessor = match old {
             Some((id, 0, predecessor)) => {
-                tx.execute("DELETE FROM outbox WHERE id=?1", [id])
+                tx.execute("DELETE FROM replica_outbox WHERE id=?1", [id])
                     .map_err(sql_failed)?;
                 predecessor
             }
@@ -97,14 +98,14 @@ impl Journal {
             None => None,
         };
         let count: u64 = tx
-            .query_row("SELECT count(*) FROM outbox", [], |r| r.get(0))
+            .query_row("SELECT count(*) FROM replica_outbox", [], |r| r.get(0))
             .map_err(sql_failed)?;
         if count >= 1024 {
             return Err(Error::Busy);
         }
-        tx.execute("INSERT INTO outbox(id,kind,entity_id,body,state,dispatched,predecessor) VALUES(?1,?2,?3,?4,'pending',0,?5)",params![operation.operation_id,kind,operation.entity_id,body,predecessor]).map_err(sql_failed)?;
+        tx.execute("INSERT INTO replica_outbox(id,kind,entity_id,body,state,dispatched,predecessor) VALUES(?1,?2,?3,?4,'pending',0,?5)",params![operation.operation_id,kind,operation.entity_id,body,predecessor]).map_err(sql_failed)?;
         bump(&tx)?;
-        let receipt=tx.query_row("SELECT (SELECT count(*) FROM outbox WHERE state='pending'),((SELECT count(*) FROM conflicts)+(SELECT count(*) FROM outbox o WHERE state='conflict' AND NOT EXISTS(SELECT 1 FROM conflicts c WHERE c.kind=o.kind AND c.entity_id=o.entity_id))),cursor,local_revision FROM meta WHERE singleton=1",[],|r|Ok(Enqueued{id:operation.operation_id.clone(),pending:r.get(0)?,conflicts:r.get(1)?,cursor:r.get(2)?,local_revision:r.get(3)?})).map_err(sql_failed)?;
+        let receipt=tx.query_row("SELECT (SELECT count(*) FROM replica_outbox WHERE state='pending'),((SELECT count(*) FROM replica_conflicts)+(SELECT count(*) FROM replica_outbox o WHERE state='conflict' AND NOT EXISTS(SELECT 1 FROM replica_conflicts c WHERE c.kind=o.kind AND c.entity_id=o.entity_id))),cursor,local_revision FROM replica_meta WHERE singleton=1",[],|r|Ok(Enqueued{id:operation.operation_id.clone(),pending:r.get(0)?,conflicts:r.get(1)?,cursor:r.get(2)?,local_revision:r.get(3)?})).map_err(sql_failed)?;
         tx.commit().map_err(sql_failed)?;
         Ok(receipt)
     }
@@ -121,12 +122,10 @@ impl Journal {
             return Err(Error::Invalid);
         }
         let mut connection = self.connection()?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_failed)?;
+        let tx = transaction(&mut connection, TransactionBehavior::Immediate)?;
         let body: Option<Vec<u8>> = tx
             .query_row(
-                "SELECT body FROM outbox WHERE id=?1 AND dispatched=1",
+                "SELECT body FROM replica_outbox WHERE id=?1 AND dispatched=1",
                 [&operation.operation_id],
                 |r| r.get(0),
             )
@@ -153,13 +152,13 @@ impl Journal {
             return Err(Error::Invalid);
         }
         let mut connection = self.connection()?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_failed)?;
+        let tx = transaction(&mut connection, TransactionBehavior::Immediate)?;
         let mut previous: i64 = tx
-            .query_row("SELECT cursor FROM meta WHERE singleton=1", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT cursor FROM replica_meta WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
             .map_err(sql_failed)?;
         for (entry, resolved) in page.entries.iter().zip(resolutions) {
             let seq = match &entry.result {
@@ -191,8 +190,11 @@ impl Journal {
         if !page.entries.is_empty() {
             bump(&tx)?;
         }
-        tx.execute("UPDATE meta SET cursor=?1 WHERE singleton=1", [previous])
-            .map_err(sql_failed)?;
+        tx.execute(
+            "UPDATE replica_meta SET cursor=?1 WHERE singleton=1",
+            [previous],
+        )
+        .map_err(sql_failed)?;
         tx.commit().map_err(sql_failed)
     }
 }
@@ -203,7 +205,9 @@ fn settle(
 ) -> Result<(), Error> {
     let id = &operation.operation_id;
     let pending: Option<Vec<u8>> = tx
-        .query_row("SELECT body FROM outbox WHERE id=?1", [id], |r| r.get(0))
+        .query_row("SELECT body FROM replica_outbox WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
         .optional()
         .map_err(sql_failed)?;
     let Some(pending) = pending else {
@@ -221,18 +225,18 @@ fn settle(
         "conflict"
     };
     tx.execute(
-        "UPDATE outbox SET predecessor=NULL,state=?1 WHERE predecessor=?2",
+        "UPDATE replica_outbox SET predecessor=NULL,state=?1 WHERE predecessor=?2",
         params![state, id],
     )
     .map_err(sql_failed)?;
-    tx.execute("DELETE FROM outbox WHERE id=?1", [id])
+    tx.execute("DELETE FROM replica_outbox WHERE id=?1", [id])
         .map_err(sql_failed)?;
     Ok(())
 }
 
 fn bump(tx: &rusqlite::Transaction<'_>) -> Result<(), Error> {
     tx.execute(
-        "UPDATE meta SET local_revision=local_revision+1 WHERE singleton=1",
+        "UPDATE replica_meta SET local_revision=local_revision+1 WHERE singleton=1",
         [],
     )
     .map_err(sql_failed)?;

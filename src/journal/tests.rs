@@ -4,6 +4,7 @@ use nddev_device_sync_domain::{
     DeviceId,
     sync::{EncryptedPayload, EntityKind, Operation},
 };
+mod fence;
 mod receipts;
 struct Owned(std::path::PathBuf);
 impl Drop for Owned {
@@ -414,4 +415,16 @@ fn actual_sqlite_capacity_failure_is_typed_and_leaves_no_partial_write() {
             .unwrap(),
         0
     );
+}
+
+fn legacy_layout(connection: &Connection) {
+    connection
+        .execute_batch(
+            "DROP VIEW meta;
+        ALTER TABLE replica_meta RENAME TO meta;
+        ALTER TABLE replica_outbox RENAME TO outbox;
+        ALTER TABLE replica_entities RENAME TO entities;
+        ALTER TABLE replica_conflicts RENAME TO conflicts;",
+        )
+        .unwrap();
 }

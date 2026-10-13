@@ -237,6 +237,7 @@ fn schema_four_rekeys_conflicts_atomically_without_changing_other_state() {
     let before = journal.stats().unwrap();
     let path = owned.0.join("replica.db");
     let db = Connection::open(&path).unwrap();
+    legacy_layout(&db);
     db.execute_batch("UPDATE conflicts SET id='operation:b'; UPDATE meta SET schema_version=4; CREATE TRIGGER reject_rekey BEFORE UPDATE ON conflicts BEGIN SELECT RAISE(ABORT,'synthetic migration failure'); END;").unwrap();
     assert!(Journal::open(path.clone()).is_err());
     assert_eq!(
@@ -264,7 +265,8 @@ fn schema_four_rekeys_conflicts_atomically_without_changing_other_state() {
     );
     assert_eq!(journal.resolution("record").unwrap().1, Some(retained));
     assert_eq!(
-        db.query_row("SELECT id FROM conflicts", [], |r| r.get::<_, String>(0))
+        db.query_row("SELECT id FROM replica_conflicts", [], |r| r
+            .get::<_, String>(0))
             .unwrap(),
         "[\"device:a\",\"operation:b\"]"
     );
@@ -272,7 +274,7 @@ fn schema_four_rekeys_conflicts_atomically_without_changing_other_state() {
         db.query_row("SELECT schema_version FROM meta", [], |r| r
             .get::<_, u32>(0))
             .unwrap(),
-        5
+        6
     );
     assert_eq!(Journal::open(path).unwrap().stats().unwrap(), before);
 }
@@ -333,7 +335,7 @@ fn concurrent_acknowledgement_and_inbox_settle_one_root_once() {
 
 #[test]
 fn every_retained_schema_upgrades_to_device_scoped_conflict_keys() {
-    for version in 1..=4 {
+    for version in 1..=5 {
         let (owned, journal, key) = owned_journal();
         let seed = encrypted(&key, "seed", "record");
         journal
@@ -345,8 +347,12 @@ fn every_retained_schema_upgrades_to_device_scoped_conflict_keys() {
             .unwrap();
         let path = owned.0.join("replica.db");
         let db = Connection::open(&path).unwrap();
-        db.execute_batch("DROP VIEW local_entities; UPDATE conflicts SET id='conflict';")
-            .unwrap();
+        legacy_layout(&db);
+        db.execute_batch("DROP VIEW local_entities;").unwrap();
+        if version < 5 {
+            db.execute_batch("UPDATE conflicts SET id='conflict';")
+                .unwrap();
+        }
         if version < 4 {
             db.execute_batch("ALTER TABLE meta DROP COLUMN local_revision;")
                 .unwrap();
@@ -367,7 +373,7 @@ fn every_retained_schema_upgrades_to_device_scoped_conflict_keys() {
             db.query_row("SELECT schema_version FROM meta", [], |r| r
                 .get::<_, u32>(0))
                 .unwrap(),
-            5
+            6
         );
     }
 }
