@@ -4,6 +4,7 @@ use nddev_device_sync_domain::{
     DeviceId,
     sync::{EncryptedPayload, EntityKind, Operation},
 };
+mod receipts;
 struct Owned(std::path::PathBuf);
 impl Drop for Owned {
     fn drop(&mut self) {
@@ -14,15 +15,18 @@ fn encrypted(key: &VaultKey, id: &str, entity: &str) -> Vec<u8> {
     encrypted_at(key, id, entity, 0)
 }
 fn encrypted_at(key: &VaultKey, id: &str, entity: &str, revision: u64) -> Vec<u8> {
+    encrypted_by(key, "device", id, entity, revision)
+}
+fn encrypted_by(key: &VaultKey, device: &str, id: &str, entity: &str, revision: u64) -> Vec<u8> {
     let scope = Scope {
         origin: "https://instance.example/".into(),
         tenant: "tenant".into(),
         user: "owner".into(),
-        device: "device".into(),
+        device: device.into(),
     };
     let mut operation = Operation {
         id: id.into(),
-        device: DeviceId::new("device").unwrap(),
+        device: DeviceId::new(device).unwrap(),
         entity_kind: EntityKind::VaultRecord,
         entity_id: entity.into(),
         base_revision: revision,
@@ -70,7 +74,7 @@ fn actual_sqlite_reopen_key_lock_and_inbox_transaction_preserve_durability() {
     let _lock = journal.key_lock().unwrap();
     journal
         .acknowledge(
-            "operation-1",
+            &first,
             &serde_json::to_vec(&result("operation-1", 1)).unwrap(),
             0,
         )
@@ -212,7 +216,7 @@ fn offline_edits_coalesce_but_claimed_bytes_and_successor_order_survive_restart(
         .unwrap();
     journal
         .acknowledge(
-            "second",
+            &second,
             &serde_json::to_vec(&applied("second", 1, 1)).unwrap(),
             0,
         )

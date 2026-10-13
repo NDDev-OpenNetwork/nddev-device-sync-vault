@@ -108,13 +108,16 @@ impl Journal {
         tx.commit().map_err(sql_failed)?;
         Ok(receipt)
     }
-    pub fn acknowledge(&self, id: &str, result: &[u8], resolved: u64) -> Result<(), Error> {
+    pub fn acknowledge(&self, request: &[u8], result: &[u8], resolved: u64) -> Result<(), Error> {
+        let operation: wire::SyncOperation =
+            serde_json::from_slice(request).map_err(|_| Error::Invalid)?;
+        crate::codec::operation(&operation, request.len())?;
         let outcome: wire::Sync = serde_json::from_slice(result).map_err(|_| Error::Invalid)?;
         let outcome_id = match &outcome {
             wire::Sync::Applied(v) => &v.operation_id,
             wire::Sync::Conflict(v) => &v.operation_id,
         };
-        if outcome_id != id {
+        if outcome_id != &operation.operation_id {
             return Err(Error::Invalid);
         }
         let mut connection = self.connection()?;
@@ -124,15 +127,19 @@ impl Journal {
         let body: Option<Vec<u8>> = tx
             .query_row(
                 "SELECT body FROM outbox WHERE id=?1 AND dispatched=1",
-                [id],
+                [&operation.operation_id],
                 |r| r.get(0),
             )
             .optional()
             .map_err(sql_failed)?;
         if let Some(body) = body {
-            let operation = serde_json::from_slice(&body).map_err(failed)?;
+            // The response belongs to the exact claimed POST, including its
+            // device. An ID alone cannot acknowledge a replacement request.
+            if body != request {
+                return Err(Error::Invalid);
+            }
             apply(&tx, &operation, &body, &outcome, result, resolved)?;
-            settle(&tx, id, &outcome)?;
+            settle(&tx, &operation, &outcome)?;
             bump(&tx)?;
         }
         // Another process may already have ingested this exact server receipt.
@@ -175,7 +182,7 @@ impl Journal {
                 &result,
                 *resolved,
             )?;
-            settle(&tx, &entry.operation.operation_id, &entry.result)?;
+            settle(&tx, &entry.operation, &entry.result)?;
             previous = seq;
         }
         if page.next_after_seq != previous || page.has_more && page.entries.is_empty() {
@@ -189,7 +196,25 @@ impl Journal {
         tx.commit().map_err(sql_failed)
     }
 }
-fn settle(tx: &rusqlite::Transaction<'_>, id: &str, outcome: &wire::Sync) -> Result<(), Error> {
+fn settle(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &wire::SyncOperation,
+    outcome: &wire::Sync,
+) -> Result<(), Error> {
+    let id = &operation.operation_id;
+    let pending: Option<Vec<u8>> = tx
+        .query_row("SELECT body FROM outbox WHERE id=?1", [id], |r| r.get(0))
+        .optional()
+        .map_err(sql_failed)?;
+    let Some(pending) = pending else {
+        return Ok(());
+    };
+    // Inbox entries contain parsed operations, not original POST bytes. Match
+    // every field after typed decoding; formatting is irrelevant here. Foreign
+    // device IDs and any changed content must leave this local family intact.
+    if !apply::same_operation(&pending, operation)? {
+        return Ok(());
+    }
     let state = if matches!(outcome, wire::Sync::Applied(_)) {
         "pending"
     } else {
