@@ -43,6 +43,8 @@ fn identity_failure(error: nddev_device_sync_accounts::ClientError) -> Error {
     use nddev_device_sync_accounts::ClientError;
     match error {
         ClientError::Busy => Error::Busy,
+        ClientError::Server(code) if code == "server_busy" => Error::Busy,
+        ClientError::Server(code) if code == "sync_capacity_exhausted" => Error::CapacityExhausted,
         ClientError::DeviceRevoked | ClientError::RevalidationRequired => Error::Locked,
         _ => Error::Unavailable,
     }
@@ -655,14 +657,17 @@ impl VaultClient {
         .await
         .map_err(dependency)
         .and_then(std::convert::identity);
-        {
-            let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
-            view.sync_error = result.as_ref().err().map(Error::code).unwrap_or_default();
-            if matches!(result, Err(Error::Locked | Error::RegistrationRequired)) {
-                view.unlocked = false;
-            }
+        self.finish_sync(result)
+    }
+    // All entry points that synchronize share the same current error projection.
+    // A blocked publication must remain visible after its background task stops.
+    fn finish_sync(&self, result: Result<VaultView, Error>) -> Result<VaultView, Error> {
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        view.sync_error = result.as_ref().err().map(Error::code).unwrap_or_default();
+        if matches!(result, Err(Error::Locked | Error::RegistrationRequired)) {
+            view.unlocked = false;
         }
-        result
+        result.map(|_| view.clone())
     }
     /// Native callers provide actual observations, never presentation-authored
     /// DTOs. A bounded batch is encrypted/durable before network acknowledgement.
@@ -673,7 +678,7 @@ impl VaultClient {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::Busy)?;
-        nddev_device_sync_accounts::runtime::timeout(replica::BATCH_DEADLINE, async {
+        let result = nddev_device_sync_accounts::runtime::timeout(replica::BATCH_DEADLINE, async {
             if snapshots.is_empty() || snapshots.len() > 32 {
                 return Err(Error::Invalid);
             }
@@ -726,7 +731,9 @@ impl VaultClient {
             self.synchronize_inner().await
         })
         .await
-        .map_err(dependency)?
+        .map_err(dependency)
+        .and_then(std::convert::identity);
+        self.finish_sync(result)
     }
     pub async fn states(&self, after: String) -> Result<StatePage, Error> {
         let _permit = self.admitted()?;
@@ -874,6 +881,7 @@ impl From<nddev_device_sync_domain::sync::SyncError> for Error {
             SyncError::Denied | SyncError::Revoked => Self::Locked,
             SyncError::Unavailable => Self::Unavailable,
             SyncError::Capacity => Self::Busy,
+            SyncError::CapacityExhausted => Self::CapacityExhausted,
             SyncError::KeyRegistration => Self::RegistrationRequired,
             _ => Self::Invalid,
         }
