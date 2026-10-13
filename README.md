@@ -11,6 +11,14 @@ request/receipt invariants. This adapter supplies authenticated transport,
 payload verification and whole journal transactions; it retains cryptography,
 key provisioning and SQLite/OPFS execution.
 
+`synchronize_inbox` uses that same authorized/key-prepared, admitted 60-second
+batch and verified journal path without claiming or posting local operations.
+Its Rust result distinguishes `inbox_at_head` from full freshness: pending work
+still prevents `caught_up` and `last_sync_at` advancement. The caller retains
+the core upload-capacity block and presents it independently of the current
+read result. Successful reads clear read errors, not upload eligibility; real
+read failures remain typed and observable. No second scheduler lives in Vault.
+
 Run `just check`. The ignored native acceptance requires an explicitly started isolated PostgreSQL/Mailpit fixture and unlocked native credential service; set `NDS_FIXTURE_RECEIPT` and run `just native-acceptance`. Host checks do not prove another platform's secure-store or UI behavior.
 
 Vault record lists use 50-entity keyset pages with explicit continuation, including

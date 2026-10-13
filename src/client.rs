@@ -27,6 +27,11 @@ struct Expected {
     cursor: Option<u64>,
     pending: Option<String>,
 }
+/// Rust runtime progress, separate from global freshness and upload eligibility.
+pub struct InboxProgress {
+    pub view: VaultView,
+    pub inbox_at_head: bool,
+}
 pub struct VaultClient {
     identity: Arc<IdentityClient>,
     scope: Scope,
@@ -640,6 +645,18 @@ impl VaultClient {
         Ok(record.secret)
     }
     pub async fn synchronize(&self) -> Result<VaultView, Error> {
+        self.synchronize_batch(false)
+            .await
+            .map(|progress| progress.view)
+    }
+    /// Read authenticated history without claiming or sending local operations.
+    /// The caller retains the core upload-capacity block independently: a
+    /// successful read is not a capacity remedy. Read failures retain their own
+    /// typed error/current projection; the caller still presents the upload block.
+    pub async fn synchronize_inbox(&self) -> Result<InboxProgress, Error> {
+        self.synchronize_batch(true).await
+    }
+    async fn synchronize_batch(&self, inbox_only: bool) -> Result<InboxProgress, Error> {
         self.authorized()?;
         let _permit = self
             .sync_gate
@@ -652,12 +669,17 @@ impl VaultClient {
             .catching_up = true;
         let result = nddev_device_sync_accounts::runtime::timeout(replica::BATCH_DEADLINE, async {
             self.ensure_key().await?;
-            self.synchronize_inner().await
+            self.reconcile_inner(inbox_only).await
         })
         .await
         .map_err(dependency)
         .and_then(std::convert::identity);
-        self.finish_sync(result)
+        let inbox_at_head = result.as_ref().is_ok_and(|progress| progress.inbox_at_head);
+        self.finish_sync(result.map(|progress| progress.view))
+            .map(|view| InboxProgress {
+                view,
+                inbox_at_head,
+            })
     }
     // All entry points that synchronize share the same current error projection.
     // A blocked publication must remain visible after its background task stops.
@@ -855,17 +877,30 @@ impl VaultClient {
         })
     }
     async fn synchronize_inner(&self) -> Result<VaultView, Error> {
+        self.reconcile_inner(false)
+            .await
+            .map(|progress| progress.view)
+    }
+    async fn reconcile_inner(&self, inbox_only: bool) -> Result<InboxProgress, Error> {
         self.view
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .catching_up = true;
         let key = self.key().await?.ok_or(Error::Locked)?;
-        let progress = replica::reconcile(&Replica { client: self, key }).await?;
+        let port = Replica { client: self, key };
+        let progress = if inbox_only {
+            replica::reconcile_inbox(&port).await?
+        } else {
+            replica::reconcile(&port).await?
+        };
         self.view
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .catching_up = !progress.caught_up;
-        self.update_view().await
+        Ok(InboxProgress {
+            view: self.update_view().await?,
+            inbox_at_head: progress.inbox_at_head,
+        })
     }
 }
 
