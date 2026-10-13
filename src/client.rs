@@ -861,14 +861,14 @@ impl VaultClient {
             let resolved = self.verify_operation(&key, &operation)?;
             let result = self
                 .identity
-                .sync_request(SyncRequest::Append(pending.body))
+                .sync_request(SyncRequest::Append(pending.body.clone()))
                 .await
                 .map_err(identity_failure)?;
             if !matches!(result.status, 201 | 409) {
                 return Err(Error::Invalid);
             }
             self.journal
-                .acknowledge(pending.id, result.body, resolved)
+                .acknowledge(pending.body, result.body, resolved)
                 .await?;
         }
         let mut more = true;

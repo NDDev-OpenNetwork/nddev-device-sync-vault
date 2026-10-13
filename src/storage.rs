@@ -35,7 +35,7 @@ pub(crate) enum Command {
         after: Option<(String, String)>,
     },
     Acknowledge {
-        id: String,
+        request: Vec<u8>,
         result: Vec<u8>,
         resolved: u64,
     },
@@ -126,11 +126,11 @@ pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Erro
         )?),
         Command::States { after } => Reply::States(journal.state_page(after)?),
         Command::Acknowledge {
-            id,
+            request,
             result,
             resolved,
         } => {
-            journal.acknowledge(&id, &result, resolved)?;
+            journal.acknowledge(&request, &result, resolved)?;
             Reply::Done
         }
         Command::Ingest { page, resolutions } => {
@@ -310,13 +310,13 @@ impl Storage {
     }
     pub async fn acknowledge(
         &self,
-        id: String,
+        request: Vec<u8>,
         result: Vec<u8>,
         resolved: u64,
     ) -> Result<(), Error> {
         match self
             .call(Command::Acknowledge {
-                id,
+                request,
                 result,
                 resolved,
             })

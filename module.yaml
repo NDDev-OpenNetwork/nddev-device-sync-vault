@@ -1,6 +1,6 @@
 id: vault
 name: nddev-device-sync-vault
-version: 0.0.1-alpha.5
+version: 0.0.1-alpha.6
 channel: alpha
 license: AGPL-3.0-only
 repository: NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-vault

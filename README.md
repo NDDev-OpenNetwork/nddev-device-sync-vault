@@ -42,8 +42,12 @@ resolution. Both append receipts and inbox replay release successors atomically.
 The queue stays bounded at 1024 operations. Refresh reads last complete sync time
 from durable metadata; offline access retains the original authorization expiry.
 Schema 4 adds a durable local mutation counter for presentation refresh across
-tabs/processes, independent of the server cursor. Do not downgrade this journal
-to an older client.
+tabs/processes, independent of the server cursor. Schema 5 scopes internal
+conflict keys by device and operation, retaining ciphertext and receipts in
+place. Append acknowledgement checks the exact claimed request; inbox settlement
+checks every operation field, including the device. Stop older clients/tabs
+before upgrading their shared journal; do not downgrade it. The migration does
+not restore records previously discarded by an older client.
 
 Browser qualification must exercise the actual composition root, credentials,
 worker restart, cross-tab writes and storage eviction/quota behavior. Browser

@@ -39,7 +39,15 @@ impl Journal {
             tx.execute_batch("ALTER TABLE meta ADD COLUMN local_revision INTEGER NOT NULL DEFAULT 0 CHECK(local_revision BETWEEN 0 AND 9007199254740991); UPDATE meta SET schema_version=4 WHERE singleton=1;").map_err(sql_failed)?;
             version = 4;
         }
-        if version != 4 {
+        if version == 4 {
+            // Conflict IDs are internal storage keys. Preserve every retained
+            // body/receipt and cursor while namespacing existing IDs by device.
+            // No table rebuild or outbox rewrite is needed. Version the changed
+            // key semantics so older clients cannot reopen this journal.
+            tx.execute_batch("UPDATE conflicts SET id=json_array(json_extract(CAST(body AS TEXT),'$.device_id'),json_extract(CAST(body AS TEXT),'$.operation_id')); UPDATE meta SET schema_version=5 WHERE singleton=1;").map_err(sql_failed)?;
+            version = 5;
+        }
+        if version != 5 {
             return Err(Error::Invalid);
         }
         // One bounded projection owns local read-your-writes. Server revision
