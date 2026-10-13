@@ -19,6 +19,14 @@ the core upload-capacity block and presents it independently of the current
 read result. Successful reads clear read errors, not upload eligibility; real
 read failures remain typed and observable. No second scheduler lives in Vault.
 
+`native_secret_at` and `ensure_record_current` use the same protected key,
+admission and journal/decode path as `native_secret`. The canonical Core
+`CredentialSelection` binds the record ref, committed revision and exact current
+pending operation ID; a replacement unsent edit can be stale at the same
+revision. Deleted/conflicted/stale or unauthorized selections deny use. Rust
+callers recheck around external awaits together with the Accounts local-use
+fence and their cancellation lifetime; no secret or durable guard enters FFI.
+
 Run `just check`. The ignored native acceptance requires an explicitly started isolated PostgreSQL/Mailpit fixture and unlocked native credential service; set `NDS_FIXTURE_RECEIPT` and run `just native-acceptance`. Host checks do not prove another platform's secure-store or UI behavior.
 
 Vault record lists use 50-entity keyset pages with explicit continuation, including
