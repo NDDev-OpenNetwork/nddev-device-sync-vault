@@ -5,6 +5,7 @@ use crate::{
 };
 use nddev_device_sync_accounts::{IdentityClient, SyncRequest, sync_wire as wire};
 use nddev_device_sync_application::replica::{self, ReplicaPort, VerifiedPage};
+use nddev_device_sync_domain::repositories::catalog::CredentialSelection;
 use nddev_device_sync_domain::vault::Record;
 use nddev_device_sync_domain::{
     DeviceId,
@@ -627,22 +628,62 @@ impl VaultClient {
     /// Native use only. The presentation wrapper delegates to native clipboard
     /// or declared provider adapters; it never returns this value through FFI.
     pub async fn native_secret(&self, id: String) -> Result<Zeroizing<String>, Error> {
-        nddev_device_sync_domain::ModuleId::new(&id).map_err(|_| Error::Invalid)?;
+        self.usable_record(&id, None)
+            .await
+            .map(|record| record.secret)
+    }
+    /// Resolve exactly the selected local version for an explicit Rust caller.
+    /// Revision alone cannot identify a replacement unsent edit. Secret bytes
+    /// remain zeroizing and must never enter a presentation DTO or FFI.
+    pub async fn native_secret_at(
+        &self,
+        selection: &CredentialSelection,
+    ) -> Result<Zeroizing<String>, Error> {
+        self.usable_record(selection.record_ref(), Some(selection))
+            .await
+            .map(|record| record.secret)
+    }
+    /// Point-in-time recheck around an external await. It neither retains a
+    /// lock across the request nor makes an already sent request revocable.
+    pub async fn ensure_record_current(
+        &self,
+        selection: &CredentialSelection,
+    ) -> Result<(), Error> {
+        self.usable_record(selection.record_ref(), Some(selection))
+            .await
+            .map(|_| ())
+    }
+    async fn usable_record(
+        &self,
+        id: &str,
+        selection: Option<&CredentialSelection>,
+    ) -> Result<Record, Error> {
+        nddev_device_sync_domain::ModuleId::new(id).map_err(|_| Error::Invalid)?;
         let _permit = self.admitted()?;
         let key = self.key().await?.ok_or(Error::Locked)?;
         let entity = self
             .journal
-            .entity("vault_record", &id)
+            .entity("vault_record", id)
             .await?
             .ok_or(Error::Invalid)?;
-        if entity.conflicted {
+        if entity.conflicted
+            || selection.is_some_and(|selected| {
+                entity.revision != selected.revision()
+                    || entity.pending_id.as_deref() != selected.pending_id()
+            })
+        {
             return Err(Error::Busy);
         }
         let record = self.decode_record(&key, &entity.body)?;
         if record.deleted {
             return Err(Error::Invalid);
         }
-        Ok(record.secret)
+        self.identity
+            .authorize_local()
+            .await
+            .map_err(identity_failure)?;
+        self.authorized()?;
+        Ok(record)
     }
     pub async fn synchronize(&self) -> Result<VaultView, Error> {
         self.synchronize_batch(false)
