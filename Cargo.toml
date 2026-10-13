@@ -1,6 +1,6 @@
 [package]
 name = "nddev-device-sync-vault"
-version = "0.0.1-alpha.9"
+version = "0.0.1-alpha.10"
 edition = "2024"
 rust-version = "1.99"
 license = "AGPL-3.0-only"
@@ -11,7 +11,7 @@ default = []
 development-http = ["nddev-device-sync-accounts/development-http"]
 
 [dependencies]
-nddev-device-sync-application = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "3a90b0fec31e946e209e7e1608367cf3b0b9163d" }
+nddev-device-sync-application = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "38b6ec5286a2a0a644c56038fa9d297646692fd2" }
 base64 = "0.22"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
@@ -19,11 +19,11 @@ serde_json = "1"
 zeroize = { version = "1.8", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
-nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "bb019a4b78f9a921c72e445c7e1ff5c0fe9c24ea" }
+nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "609b7d7a83a51fdd0a59800f4b2f69344be35142" }
 time = { version = "0.3", features = ["wasm-bindgen"] }
 uuid = { version = "1.27", features = ["v4"] }
-nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "3a90b0fec31e946e209e7e1608367cf3b0b9163d" }
-nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts.git", rev = "f2da631fc3ae7c2bd6b04955d285e55bf999691a" }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "38b6ec5286a2a0a644c56038fa9d297646692fd2" }
+nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts.git", rev = "f68d0e306899fad98fb6d85e38d8e5d15173de09" }
 
 tokio = { version = "1.53", features = ["rt", "sync", "time"] }
 sha2 = "0.10"
