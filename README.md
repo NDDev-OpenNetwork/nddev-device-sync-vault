@@ -23,7 +23,10 @@ read failures remain typed and observable. No second scheduler lives in Vault.
 admission and journal/decode path as `native_secret`. The canonical Core
 `CredentialSelection` binds the record ref, committed revision and exact current
 pending operation ID; a replacement unsent edit can be stale at the same
-revision. Deleted/conflicted/stale or unauthorized selections deny use. Rust
+revision. Missing/deleted/conflicted/stale selections return `SelectionChanged`;
+admission remains `Busy`, and corrupt input retains its existing `Invalid` or
+`Authentication` class. Legacy `native_secret(id)` retains its existing errors.
+Unauthorized selections deny use. Rust
 callers recheck around external awaits together with the Accounts local-use
 fence and their cancellation lifetime; no secret or durable guard enters FFI.
 
