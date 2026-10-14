@@ -661,22 +661,31 @@ impl VaultClient {
         nddev_device_sync_domain::ModuleId::new(id).map_err(|_| Error::Invalid)?;
         let _permit = self.admitted()?;
         let key = self.key().await?.ok_or(Error::Locked)?;
+        let missing_or_deleted = if selection.is_some() {
+            Error::SelectionChanged
+        } else {
+            Error::Invalid
+        };
         let entity = self
             .journal
             .entity("vault_record", id)
             .await?
-            .ok_or(Error::Invalid)?;
+            .ok_or(missing_or_deleted)?;
         if entity.conflicted
             || selection.is_some_and(|selected| {
                 entity.revision != selected.revision()
                     || entity.pending_id.as_deref() != selected.pending_id()
             })
         {
-            return Err(Error::Busy);
+            return Err(if selection.is_some() {
+                Error::SelectionChanged
+            } else {
+                Error::Busy
+            });
         }
         let record = self.decode_record(&key, &entity.body)?;
         if record.deleted {
-            return Err(Error::Invalid);
+            return Err(missing_or_deleted);
         }
         self.identity
             .authorize_local()
