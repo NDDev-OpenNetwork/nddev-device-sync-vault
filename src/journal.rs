@@ -7,12 +7,12 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use std::fs::{self, File, OpenOptions};
 use std::{path::PathBuf, time::Duration};
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 fn check_version(connection: &Connection) -> Result<(), Error> {
     let version: u32 = connection
         .query_row(
-            "SELECT schema_version FROM replica_meta WHERE singleton=1",
+            "SELECT schema_version FROM v3_meta WHERE singleton=1",
             [],
             |row| row.get(0),
         )
@@ -38,6 +38,45 @@ fn transaction(
 #[derive(Clone)]
 pub struct Journal {
     path: PathBuf,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct EditTarget {
+    pub entity: Option<Entity>,
+    pub committed: Option<Vec<u8>>,
+    pub writer: WriterSnapshot,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ResolutionGuard {
+    pub cursor: u64,
+    pub local_revision: u64,
+    pub lifecycle: nddev_device_sync_domain::sync::history::Lifecycle,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ObservationTarget {
+    pub effective: Option<Entity>,
+    // Exact committed operation bytes: main Rust decodes its eventual outer
+    // lifecycle/header. Never infer it from a pending payload or from cursor.
+    pub committed_operation: Option<Vec<u8>>,
+    pub cursor: u64,
+}
+// Mechanical IPC metadata projection for NdsClient::CatalogPort.
+// No payload, keys or domain decisions are carried by this read.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ObservationMetadata {
+    pub id: String,
+    pub revision: u64,
+    pub next_base: u64,
+    pub pending_id: Option<String>,
+    pub conflicted: bool,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ObservationBaselines {
+    // Encrypted source operation, validated in main Rust and used as an opaque
+    // same-transaction source-body expectation. No credential bytes.
+    pub selected_operation: Vec<u8>,
+    pub targets: Vec<ObservationMetadata>,
+    pub cursor: u64,
+    pub local_revision: u64,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Pending {
@@ -183,9 +222,13 @@ impl Journal {
 }
 
 mod apply;
+mod checkpoint;
+pub(crate) use checkpoint::{RawRow, StageGuard, StageProgress};
 mod outbox;
+mod writer;
+pub(crate) use writer::{WriterEnqueueGuard, WriterSnapshot};
 mod reads;
 mod schema;
-use apply::{apply, kind};
+use apply::apply;
 #[cfg(test)]
 mod tests;

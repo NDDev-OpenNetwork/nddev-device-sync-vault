@@ -274,7 +274,7 @@ fn schema_four_rekeys_conflicts_atomically_without_changing_other_state() {
         db.query_row("SELECT schema_version FROM meta", [], |r| r
             .get::<_, u32>(0))
             .unwrap(),
-        6
+        7
     );
     assert_eq!(Journal::open(path).unwrap().stats().unwrap(), before);
 }
@@ -373,7 +373,7 @@ fn every_retained_schema_upgrades_to_device_scoped_conflict_keys() {
             db.query_row("SELECT schema_version FROM meta", [], |r| r
                 .get::<_, u32>(0))
                 .unwrap(),
-            6
+            7
         );
     }
 }

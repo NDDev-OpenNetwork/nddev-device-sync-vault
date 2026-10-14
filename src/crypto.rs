@@ -1,5 +1,6 @@
 //! Maintained native AES-GCM record encryption; no bespoke cipher.
 use crate::Error;
+use nddev_device_sync_domain::sync::history::{AadScope, OperationVersion, VersionedOperation};
 use nddev_device_sync_domain::sync::{EncryptedPayload, MAX_PLAIN_BYTES, Operation};
 use ring::{
     aead,
@@ -7,7 +8,7 @@ use ring::{
 };
 use zeroize::Zeroizing;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Scope {
     pub origin: String,
     pub tenant: String,
@@ -55,6 +56,21 @@ impl VaultKey {
         operation: &Operation,
         plaintext: &[u8],
     ) -> Result<EncryptedPayload, Error> {
+        self.encrypt_versioned(
+            scope,
+            &VersionedOperation {
+                operation: operation.clone(),
+                version: OperationVersion::V2,
+            },
+            plaintext,
+        )
+    }
+    pub(crate) fn encrypt_versioned(
+        &self,
+        scope: &Scope,
+        operation: &VersionedOperation,
+        plaintext: &[u8],
+    ) -> Result<EncryptedPayload, Error> {
         if plaintext.len() > MAX_PLAIN_BYTES {
             return Err(Error::Invalid);
         }
@@ -82,7 +98,20 @@ impl VaultKey {
         scope: &Scope,
         operation: &Operation,
     ) -> Result<Zeroizing<Vec<u8>>, Error> {
-        let payload = &operation.payload;
+        self.decrypt_versioned(
+            scope,
+            &VersionedOperation {
+                operation: operation.clone(),
+                version: OperationVersion::V2,
+            },
+        )
+    }
+    pub(crate) fn decrypt_versioned(
+        &self,
+        scope: &Scope,
+        operation: &VersionedOperation,
+    ) -> Result<Zeroizing<Vec<u8>>, Error> {
+        let payload = &operation.operation.payload;
         if payload.key_id != self.id() {
             return Err(Error::Locked);
         }
@@ -107,20 +136,20 @@ impl VaultKey {
         Ok(plain)
     }
 }
-fn record_aad(scope: &Scope, operation: &Operation, key: &str) -> Result<Vec<u8>, Error> {
+fn record_aad(scope: &Scope, operation: &VersionedOperation, key: &str) -> Result<Vec<u8>, Error> {
     validate_scope(scope)?;
-    serde_json::to_vec(&(
-        "NDS-RECORD-V2",
-        &scope.origin,
-        &scope.tenant,
-        &scope.user,
-        operation.device.as_str(),
-        operation.entity_kind.as_str(),
-        &operation.entity_id,
-        &operation.id,
-        operation.base_revision,
-        key,
-    ))
+    serde_json::to_vec(
+        &operation
+            .aad(
+                AadScope {
+                    origin: &scope.origin,
+                    tenant: &scope.tenant,
+                    user: &scope.user,
+                },
+                key,
+            )
+            .map_err(|_| Error::Invalid)?,
+    )
     .map_err(|_| Error::Invalid)
 }
 fn random(bytes: &mut [u8]) -> Result<(), Error> {

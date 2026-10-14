@@ -21,23 +21,136 @@ fn conflict(connection: &Connection, id: &str) -> Result<Option<Vec<u8>>, Error>
     // A blocked successor is the latest local intent. Preserve it even though
     // only its predecessor received a server conflict receipt.
     connection.query_row("SELECT COALESCE(
-        (SELECT body FROM replica_outbox WHERE kind='vault_record' AND entity_id=?1 AND state='conflict' ORDER BY rowid DESC LIMIT 1),
-        (SELECT body FROM replica_conflicts WHERE kind='vault_record' AND entity_id=?1 ORDER BY json_extract(CAST(result AS TEXT),'$.server_seq') DESC LIMIT 1))",[id],|r|r.get(0)).map_err(sql_failed)
+        (SELECT body FROM v3_outbox WHERE kind='vault_record' AND entity_id=?1 AND state='conflict' ORDER BY rowid DESC LIMIT 1),
+        (SELECT body FROM v3_conflicts WHERE kind='vault_record' AND entity_id=?1 ORDER BY json_extract(CAST(result AS TEXT),'$.server_seq') DESC LIMIT 1))",[id],|r|r.get(0)).map_err(sql_failed)
+}
+pub(super) fn selected_current(
+    connection: &Connection,
+    selected: &nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+) -> Result<Entity, Error> {
+    selected.validate().map_err(|_| Error::Invalid)?;
+    let record = entity(connection, "vault_record", selected.record_ref())?
+        .ok_or(Error::SelectionChanged)?;
+    if record.conflicted
+        || record.revision != selected.revision()
+        || record.pending_id.as_deref() != selected.pending_id()
+    {
+        return Err(Error::SelectionChanged);
+    }
+    Ok(record)
 }
 impl Journal {
+    pub(crate) fn edit_target(
+        &self,
+        kind: &str,
+        id: &str,
+        known: u64,
+    ) -> Result<EditTarget, Error> {
+        if known > nddev_device_sync_domain::sync::MAX_REVISION {
+            return Err(Error::Invalid);
+        }
+        let mut connection = self.connection()?;
+        let tx = transaction(&mut connection, TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE v3_meta SET known_committed_seq=MAX(known_committed_seq,?1) WHERE singleton=1",
+            [known],
+        )
+        .map_err(sql_failed)?;
+        let target = EditTarget {
+            entity: entity(&tx, kind, id)?,
+            committed: tx
+                .query_row(
+                    "SELECT body FROM v3_entities WHERE kind=?1 AND id=?2",
+                    params![kind, id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(sql_failed)?,
+            writer: writer::read(&tx)?,
+        };
+        tx.commit().map_err(sql_failed)?;
+        Ok(target)
+    }
+    pub fn observation_target(&self, id: &str) -> Result<ObservationTarget, Error> {
+        let mut connection = self.connection()?;
+        let tx = transaction(&mut connection, TransactionBehavior::Deferred)?;
+        let effective = entity(&tx, "repository_state", id)?;
+        let committed_operation = tx
+            .query_row(
+                "SELECT body FROM v3_entities WHERE kind='repository_state' AND id=?1",
+                [id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(sql_failed)?;
+        let cursor = tx
+            .query_row("SELECT cursor FROM v3_meta WHERE singleton=1", [], |row| {
+                row.get(0)
+            })
+            .map_err(sql_failed)?;
+        tx.commit().map_err(sql_failed)?;
+        Ok(ObservationTarget {
+            effective,
+            committed_operation,
+            cursor,
+        })
+    }
+    /// One short metadata/selection transaction before provider I/O.
+    /// Canonical key parsing and decisions remain in Core/main Rust.
+    pub fn observation_baselines(
+        &self,
+        selected: &nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+    ) -> Result<ObservationBaselines, Error> {
+        let mut connection = self.connection()?;
+        let tx = transaction(&mut connection, TransactionBehavior::Deferred)?;
+        let selected_operation = selected_current(&tx, selected)?.body;
+        let targets = {
+            let mut query = tx.prepare("SELECT id,revision,next_base,pending_id,conflicted FROM local_entities WHERE kind='repository_state' ORDER BY id LIMIT ?1").map_err(sql_failed)?;
+            query
+                .query_map([(nddev_device_sync_application::repositories::catalog::observations::MAX_BASELINES + 1) as u32], |row| {
+                    Ok(ObservationMetadata {
+                        id: row.get(0)?,
+                        revision: row.get(1)?,
+                        next_base: row.get(2)?,
+                        pending_id: row.get(3)?,
+                        conflicted: row.get(4)?,
+                    })
+                })
+                .map_err(sql_failed)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sql_failed)?
+        };
+        if targets.len()
+            > nddev_device_sync_application::repositories::catalog::observations::MAX_BASELINES
+        {
+            return Err(Error::Busy);
+        }
+        let (cursor, local_revision) = tx
+            .query_row(
+                "SELECT cursor,local_revision FROM v3_meta WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sql_failed)?;
+        tx.commit().map_err(sql_failed)?;
+        Ok(ObservationBaselines {
+            selected_operation,
+            targets,
+            cursor,
+            local_revision,
+        })
+    }
     pub fn cursor(&self) -> Result<u64, Error> {
         self.read(|connection| {
             connection
-                .query_row(
-                    "SELECT cursor FROM replica_meta WHERE singleton=1",
-                    [],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT cursor FROM v3_meta WHERE singleton=1", [], |r| {
+                    r.get(0)
+                })
                 .map_err(sql_failed)
         })
     }
     pub fn stats(&self) -> Result<(u32, u32, u64, u64, u64), Error> {
-        self.read(|connection| connection.query_row("SELECT (SELECT count(*) FROM replica_outbox WHERE state='pending'),((SELECT count(*) FROM replica_conflicts)+(SELECT count(*) FROM replica_outbox o WHERE state='conflict' AND NOT EXISTS(SELECT 1 FROM replica_conflicts c WHERE c.kind=o.kind AND c.entity_id=o.entity_id))),cursor,last_sync_at,local_revision FROM replica_meta WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map_err(sql_failed))
+        self.read(|connection| connection.query_row("SELECT (SELECT count(*) FROM v3_outbox WHERE state='pending'),((SELECT count(*) FROM v3_conflicts)+(SELECT count(*) FROM v3_outbox o WHERE state='conflict' AND NOT EXISTS(SELECT 1 FROM v3_conflicts c WHERE c.kind=o.kind AND c.entity_id=o.entity_id))),cursor,last_sync_at,local_revision FROM v3_meta WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map_err(sql_failed))
     }
     #[cfg(test)]
     pub fn counts(&self) -> Result<(u32, u32), Error> {
@@ -47,20 +160,75 @@ impl Journal {
     pub fn entity(&self, kind: &str, id: &str) -> Result<Option<Entity>, Error> {
         self.read(|connection| entity(connection, kind, id))
     }
-    pub fn resolution(&self, id: &str) -> Result<(Entity, Option<Vec<u8>>, u64), Error> {
+    pub(crate) fn resolution(
+        &self,
+        id: &str,
+    ) -> Result<(Entity, Option<Vec<u8>>, ResolutionGuard), Error> {
         let mut connection = self.connection()?;
         let tx = transaction(&mut connection, TransactionBehavior::Deferred)?;
         let entity = entity(&tx, "vault_record", id)?.ok_or(Error::Invalid)?;
         let conflict = conflict(&tx, id)?;
-        let cursor = tx
+        let (cursor, local_revision, known): (u64, u64, u64) = tx
             .query_row(
-                "SELECT cursor FROM replica_meta WHERE singleton=1",
+                "SELECT cursor,local_revision,known_committed_seq FROM v3_meta WHERE singleton=1",
                 [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(sql_failed)?;
+        let body: Vec<u8> = tx
+            .query_row(
+                "SELECT body FROM v3_entities WHERE kind='vault_record' AND id=?1",
+                [id],
                 |r| r.get(0),
             )
             .map_err(sql_failed)?;
+        let committed = crate::codec::versioned(&body)?;
+        if committed.operation.entity_kind
+            != nddev_device_sync_domain::sync::EntityKind::VaultRecord
+            || committed.operation.entity_id != id
+        {
+            return Err(Error::Invalid);
+        }
+        let mut sequences = Vec::new();
+        {
+            // Decode one original at a time; only bounded receipt sequence
+            // metadata is collected, never a second ciphertext set over IPC.
+            let mut query = tx.prepare(
+                "SELECT body,result FROM v3_conflicts WHERE kind='vault_record' AND entity_id=?1 LIMIT ?2",
+            ).map_err(sql_failed)?;
+            let mut rows = query
+                .query(params![
+                    id,
+                    nddev_device_sync_domain::sync::MAX_OPERATIONS + 1
+                ])
+                .map_err(sql_failed)?;
+            while let Some(row) = rows.next().map_err(sql_failed)? {
+                let body: Vec<u8> = row.get(0).map_err(sql_failed)?;
+                let result: Vec<u8> = row.get(1).map_err(sql_failed)?;
+                let (operation, receipt) = crate::codec::original_receipt(&body, &result, 409)?;
+                if operation.operation.entity_kind != committed.operation.entity_kind
+                    || operation.operation.entity_id != id
+                {
+                    return Err(Error::Invalid);
+                }
+                sequences.push(receipt.server_seq);
+            }
+        }
+        let lifecycle = nddev_device_sync_domain::sync::history::resolution_lifecycle(
+            committed.lifecycle(),
+            &sequences,
+            cursor.max(known),
+        )?;
         tx.commit().map_err(sql_failed)?;
-        Ok((entity, conflict, cursor))
+        Ok((
+            entity,
+            conflict,
+            ResolutionGuard {
+                cursor,
+                local_revision,
+                lifecycle,
+            },
+        ))
     }
     pub fn record_page(&self, after: &str) -> Result<(Vec<RecordEntry>, u64, u64), Error> {
         let mut connection = self.connection()?;
@@ -86,7 +254,7 @@ impl Journal {
         }
         let (cursor, local_revision) = tx
             .query_row(
-                "SELECT cursor,local_revision FROM replica_meta WHERE singleton=1",
+                "SELECT cursor,local_revision FROM v3_meta WHERE singleton=1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -95,7 +263,7 @@ impl Journal {
         Ok((entries, cursor, local_revision))
     }
     pub fn latest_clipboard(&self) -> Result<Option<(String, Entity)>, Error> {
-        self.read(|connection| connection.query_row("SELECT revision,body,server_seq,EXISTS(SELECT 1 FROM replica_conflicts WHERE kind='clipboard_item' AND entity_id=replica_entities.id),NULL,revision,id FROM replica_entities WHERE kind='clipboard_item' AND server_seq>0 ORDER BY server_seq DESC LIMIT 1",[],|r|Ok((r.get(6)?,read_entity(r)?))).optional().map_err(sql_failed))
+        self.read(|connection| connection.query_row("SELECT revision,body,server_seq,EXISTS(SELECT 1 FROM v3_conflicts WHERE kind='clipboard_item' AND entity_id=v3_entities.id),NULL,revision,id FROM v3_entities WHERE kind='clipboard_item' AND server_seq>0 ORDER BY server_seq DESC LIMIT 1",[],|r|Ok((r.get(6)?,read_entity(r)?))).optional().map_err(sql_failed))
     }
     pub fn state_page(
         &self,
@@ -116,7 +284,7 @@ impl Journal {
     pub fn caught_up(&self, cursor: u64, at: u64) -> Result<bool, Error> {
         let mut connection = self.connection()?;
         let tx = transaction(&mut connection, TransactionBehavior::Immediate)?;
-        let changed = tx.execute("UPDATE replica_meta SET last_sync_at=?1 WHERE singleton=1 AND cursor=?2 AND NOT EXISTS(SELECT 1 FROM replica_outbox WHERE state='pending')",params![at,cursor]).map_err(sql_failed)? == 1;
+        let changed = tx.execute("UPDATE v3_meta SET last_sync_at=?1 WHERE singleton=1 AND cursor=?2 AND known_committed_seq<=cursor AND NOT EXISTS(SELECT 1 FROM v3_outbox WHERE state='pending')",params![at,cursor]).map_err(sql_failed)? == 1;
         tx.commit().map_err(sql_failed)?;
         Ok(changed)
     }
