@@ -4,7 +4,9 @@ use nddev_device_sync_domain::{
     DeviceId,
     sync::{EncryptedPayload, EntityKind, Operation},
 };
+mod checkpoint;
 mod fence;
+mod io;
 mod receipts;
 struct Owned(std::path::PathBuf);
 impl Drop for Owned {
@@ -290,7 +292,8 @@ fn conflict_resolution(remote_resolution: bool) {
             .unwrap();
         assert_eq!(journal.counts().unwrap(), (0, 1));
     }
-    let (entity, _, cursor) = journal.resolution("record").unwrap();
+    let (entity, _, guard) = journal.resolution("record").unwrap();
+    let cursor = guard.cursor;
     let revision = entity.revision;
     let resolution = encrypted_at(&key, "resolution", "record", revision);
     assert!(matches!(
@@ -421,10 +424,24 @@ fn legacy_layout(connection: &Connection) {
     connection
         .execute_batch(
             "DROP VIEW meta;
-        ALTER TABLE replica_meta RENAME TO meta;
-        ALTER TABLE replica_outbox RENAME TO outbox;
-        ALTER TABLE replica_entities RENAME TO entities;
-        ALTER TABLE replica_conflicts RENAME TO conflicts;",
+        DROP VIEW replica_meta;
+        DROP VIEW replica_outbox;
+        DROP VIEW replica_entities;
+        DROP VIEW replica_conflicts;
+        DROP TABLE checkpoint_rows;
+        DROP TABLE checkpoint_meta;
+        ALTER TABLE v3_meta RENAME TO meta;
+        ALTER TABLE v3_outbox RENAME TO outbox;
+        ALTER TABLE v3_entities RENAME TO entities;
+        ALTER TABLE v3_conflicts RENAME TO conflicts;
+        ALTER TABLE meta DROP COLUMN known_committed_seq;
+        ALTER TABLE meta DROP COLUMN legacy_v2_context;
+        ALTER TABLE meta DROP COLUMN writer_mode;
+        ALTER TABLE meta DROP COLUMN writer_key_id;
+        ALTER TABLE meta DROP COLUMN confirmed_basis_seq;
+        ALTER TABLE outbox DROP COLUMN terminal_unknown_reason;
+        ALTER TABLE entities DROP COLUMN receipt_body;
+        ALTER TABLE entities DROP COLUMN receipt_status;",
         )
         .unwrap();
 }

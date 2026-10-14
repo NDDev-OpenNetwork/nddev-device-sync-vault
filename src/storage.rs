@@ -2,7 +2,9 @@
 //! the same journal transactions; no SQL, keys or plaintext cross the IPC port.
 use crate::{
     Error,
-    journal::{Enqueued, Entity, Journal, Pending, RecordEntry},
+    journal::{
+        Enqueued, Entity, Journal, ObservationBaselines, ObservationTarget, Pending, RecordEntry,
+    },
 };
 use nddev_device_sync_accounts::sync_wire as wire;
 use serde::{Deserialize, Serialize};
@@ -11,9 +13,105 @@ use tokio::sync::Semaphore;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Command {
+    EditTarget {
+        kind: String,
+        id: String,
+        known: u64,
+    },
+    CheckpointHandle {
+        scope_tag: String,
+        key_id: String,
+    },
+    EnqueueWriter {
+        body: Vec<u8>,
+        expected_cursor: Option<u64>,
+        expected_revision: u64,
+        expected_pending: Option<String>,
+        writer: crate::journal::WriterEnqueueGuard,
+    },
+    WriterSnapshot,
+    ConfirmWriter {
+        expected: crate::journal::WriterSnapshot,
+        mode: u8,
+        key_id: String,
+        basis: Option<u64>,
+    },
+    MarkUnknown {
+        id: String,
+        request: Vec<u8>,
+        reason: String,
+    },
+    UnknownReason,
+    CheckpointProgress {
+        guard: crate::journal::StageGuard,
+    },
+    AcknowledgeOriginal {
+        request: Vec<u8>,
+        result: Vec<u8>,
+        status: u16,
+        resolved: u64,
+    },
+    IngestOriginal {
+        head: u64,
+        floor: u64,
+        after: u64,
+        rows: Vec<crate::journal::RawRow>,
+        next: u64,
+        more: bool,
+    },
+    ResumeCheckpoint {
+        scope_tag: String,
+        key_id: String,
+        known: u64,
+    },
+    ResetCheckpoint {
+        scope_tag: String,
+        key_id: String,
+    },
+    BeginCheckpoint {
+        scope_tag: String,
+        key_id: String,
+        base: u64,
+        total: usize,
+        known: u64,
+    },
+    StageBase {
+        guard: crate::journal::StageGuard,
+        base: u64,
+        total: usize,
+        rows: Vec<crate::journal::RawRow>,
+        next: u64,
+        more: bool,
+    },
+    StageDelta {
+        guard: crate::journal::StageGuard,
+        floor: u64,
+        rows: Vec<crate::journal::RawRow>,
+        next: u64,
+        more: bool,
+    },
+    InstallCheckpoint {
+        guard: crate::journal::StageGuard,
+    },
+    DiscardCheckpoint {
+        guard: crate::journal::StageGuard,
+    },
     Stats,
     Pending,
     Cursor,
+    ObservationTarget {
+        id: String,
+    },
+    ObservationBaselines {
+        selected: nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+    },
+    EnqueueObservation {
+        body: Vec<u8>,
+        expected_revision: u64,
+        expected_pending: Option<String>,
+        selected: nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+        selected_operation: Vec<u8>,
+    },
     Entity {
         kind: String,
         id: String,
@@ -51,9 +149,29 @@ pub(crate) enum Command {
 impl Command {
     fn event(&self) -> &'static str {
         match self {
+            Self::EditTarget { .. } => "vault.storage.edit_target",
+            Self::CheckpointHandle { .. } => "vault.storage.checkpoint_handle",
+            Self::EnqueueWriter { .. } => "vault.storage.enqueue_writer",
+            Self::WriterSnapshot => "vault.storage.writer_snapshot",
+            Self::ConfirmWriter { .. } => "vault.storage.writer_confirm",
+            Self::MarkUnknown { .. } => "vault.storage.unknown",
+            Self::UnknownReason => "vault.storage.unknown_reason",
+            Self::CheckpointProgress { .. } => "vault.storage.checkpoint_progress",
+            Self::AcknowledgeOriginal { .. } => "vault.storage.acknowledge_original",
+            Self::IngestOriginal { .. } => "vault.storage.ingest_original",
+            Self::ResumeCheckpoint { .. } => "vault.storage.checkpoint_resume",
+            Self::ResetCheckpoint { .. } => "vault.storage.checkpoint_reset",
+            Self::BeginCheckpoint { .. } => "vault.storage.checkpoint_begin",
+            Self::StageBase { .. } => "vault.storage.checkpoint_base",
+            Self::StageDelta { .. } => "vault.storage.checkpoint_delta",
+            Self::InstallCheckpoint { .. } => "vault.storage.checkpoint_install",
+            Self::DiscardCheckpoint { .. } => "vault.storage.checkpoint_discard",
             Self::Stats => "vault.storage.stats",
             Self::Pending => "vault.storage.claim",
             Self::Cursor => "vault.storage.cursor",
+            Self::ObservationTarget { .. } => "vault.storage.observation_target",
+            Self::ObservationBaselines { .. } => "vault.storage.observation_baselines",
+            Self::EnqueueObservation { .. } => "vault.storage.enqueue_observation",
             Self::Entity { .. } => "vault.storage.entity",
             Self::Records { .. } => "vault.storage.records",
             Self::Resolution { .. } => "vault.storage.resolution",
@@ -82,12 +200,20 @@ fn completed(
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Reply {
+    EditTarget(crate::journal::EditTarget),
+    WriterSnapshot(crate::journal::WriterSnapshot),
+    UnknownReason(Option<String>),
+    CheckpointProgress(crate::journal::StageProgress),
+    Stage(crate::journal::StageGuard),
+    MaybeStage(Option<crate::journal::StageGuard>),
     Stats(u32, u32, u64, u64, u64),
     Pending(Vec<Pending>),
     Cursor(u64),
+    ObservationBaselines(ObservationBaselines),
+    ObservationTarget(ObservationTarget),
     Entity(Option<Entity>),
     Records(Vec<RecordEntry>, u64, u64),
-    Resolution(Entity, Option<Vec<u8>>, u64),
+    Resolution(Entity, Option<Vec<u8>>, crate::journal::ResolutionGuard),
     Bool(bool),
     Clipboard(Option<(String, Entity)>),
     Enqueued(Enqueued),
@@ -97,12 +223,144 @@ pub(crate) enum Reply {
 
 pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Error> {
     Ok(match command {
+        Command::EditTarget { kind, id, known } => {
+            Reply::EditTarget(journal.edit_target(&kind, &id, known)?)
+        }
+        Command::CheckpointHandle { scope_tag, key_id } => {
+            Reply::MaybeStage(journal.checkpoint_handle(&scope_tag, &key_id)?)
+        }
+        Command::EnqueueWriter {
+            body,
+            expected_cursor,
+            expected_revision,
+            expected_pending,
+            writer,
+        } => Reply::Enqueued(journal.enqueue_writer(
+            body,
+            expected_cursor,
+            expected_revision,
+            expected_pending,
+            &writer,
+        )?),
+        Command::WriterSnapshot => Reply::WriterSnapshot(journal.writer_snapshot()?),
+        Command::ConfirmWriter {
+            expected,
+            mode,
+            key_id,
+            basis,
+        } => Reply::WriterSnapshot(journal.confirm_writer(&expected, mode, &key_id, basis)?),
+        Command::MarkUnknown {
+            id,
+            request,
+            reason,
+        } => {
+            journal.mark_unknown(&id, &request, &reason)?;
+            Reply::Done
+        }
+        Command::UnknownReason => Reply::UnknownReason(journal.unknown_reason()?),
+        Command::CheckpointProgress { guard } => {
+            Reply::CheckpointProgress(journal.checkpoint_progress(&guard)?)
+        }
+        Command::AcknowledgeOriginal {
+            request,
+            result,
+            status,
+            resolved,
+        } => {
+            journal.acknowledge_original(&request, &result, status, resolved)?;
+            Reply::Done
+        }
+        Command::IngestOriginal {
+            head,
+            floor,
+            after,
+            rows,
+            next,
+            more,
+        } => {
+            journal.ingest_original(
+                nddev_device_sync_domain::sync::history::HistoryVersion {
+                    head,
+                    floor,
+                    base: floor,
+                },
+                after,
+                &rows,
+                next,
+                more,
+            )?;
+            Reply::Done
+        }
+        Command::ResumeCheckpoint {
+            scope_tag,
+            key_id,
+            known,
+        } => Reply::MaybeStage(journal.resume_checkpoint(&scope_tag, &key_id, known)?),
+        Command::ResetCheckpoint { scope_tag, key_id } => {
+            journal.reset_checkpoint(&scope_tag, &key_id)?;
+            Reply::Done
+        }
+        Command::BeginCheckpoint {
+            scope_tag,
+            key_id,
+            base,
+            total,
+            known,
+        } => Reply::Stage(journal.begin_checkpoint(&scope_tag, &key_id, base, total, known)?),
+        Command::StageBase {
+            guard,
+            base,
+            total,
+            rows,
+            next,
+            more,
+        } => {
+            journal.stage_base(&guard, base, total, &rows, next, more)?;
+            Reply::Done
+        }
+        Command::StageDelta {
+            guard,
+            floor,
+            rows,
+            next,
+            more,
+        } => {
+            journal.stage_delta(&guard, floor, &rows, next, more)?;
+            Reply::Done
+        }
+        Command::InstallCheckpoint { guard } => {
+            journal.install_checkpoint(&guard)?;
+            Reply::Done
+        }
+        Command::DiscardCheckpoint { guard } => {
+            journal.discard_checkpoint(&guard)?;
+            Reply::Done
+        }
         Command::Stats => {
             let (pending, conflicts, cursor, at, local) = journal.stats()?;
             Reply::Stats(pending, conflicts, cursor, at, local)
         }
         Command::Pending => Reply::Pending(journal.pending()?),
         Command::Cursor => Reply::Cursor(journal.cursor()?),
+        Command::ObservationTarget { id } => {
+            Reply::ObservationTarget(journal.observation_target(&id)?)
+        }
+        Command::ObservationBaselines { selected } => {
+            Reply::ObservationBaselines(journal.observation_baselines(&selected)?)
+        }
+        Command::EnqueueObservation {
+            body,
+            expected_revision,
+            expected_pending,
+            selected,
+            selected_operation,
+        } => Reply::Enqueued(journal.enqueue_observation(
+            body,
+            expected_revision,
+            expected_pending,
+            &selected,
+            &selected_operation,
+        )?),
         Command::Entity { kind, id } => Reply::Entity(journal.entity(&kind, &id)?),
         Command::Records { after } => {
             let (items, cursor, local) = journal.record_page(&after)?;
@@ -177,7 +435,7 @@ impl Storage {
             })
         }
     }
-    async fn call(&self, command: Command) -> Result<Reply, Error> {
+    pub(crate) async fn call(&self, command: Command) -> Result<Reply, Error> {
         let event = command.event();
         let span = nddev_device_sync_telemetry::operation_span("vault", "io")
             .map_err(|_| Error::Unavailable)?;
@@ -267,7 +525,10 @@ impl Storage {
             _ => Err(Error::Invalid),
         }
     }
-    pub async fn resolution(&self, id: String) -> Result<(Entity, Option<Vec<u8>>, u64), Error> {
+    pub async fn resolution(
+        &self,
+        id: String,
+    ) -> Result<(Entity, Option<Vec<u8>>, crate::journal::ResolutionGuard), Error> {
         match self.call(Command::Resolution { id }).await? {
             Reply::Resolution(e, c, s) => Ok((e, c, s)),
             _ => Err(Error::Invalid),
@@ -279,50 +540,12 @@ impl Storage {
             _ => Err(Error::Invalid),
         }
     }
-    pub async fn enqueue(
-        &self,
-        body: Vec<u8>,
-        expected_cursor: Option<u64>,
-        expected_revision: u64,
-        expected_pending: Option<String>,
-    ) -> Result<Enqueued, Error> {
-        match self
-            .call(Command::Enqueue {
-                body,
-                expected_cursor,
-                expected_revision,
-                expected_pending,
-            })
-            .await?
-        {
-            Reply::Enqueued(v) => Ok(v),
-            _ => Err(Error::Invalid),
-        }
-    }
     pub async fn state_page(
         &self,
         after: Option<(String, String)>,
     ) -> Result<Vec<(String, String, Entity)>, Error> {
         match self.call(Command::States { after }).await? {
             Reply::States(v) => Ok(v),
-            _ => Err(Error::Invalid),
-        }
-    }
-    pub async fn acknowledge(
-        &self,
-        request: Vec<u8>,
-        result: Vec<u8>,
-        resolved: u64,
-    ) -> Result<(), Error> {
-        match self
-            .call(Command::Acknowledge {
-                request,
-                result,
-                resolved,
-            })
-            .await?
-        {
-            Reply::Done => Ok(()),
             _ => Err(Error::Invalid),
         }
     }

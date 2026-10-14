@@ -7,7 +7,7 @@ impl Journal {
         let mut connection = self.connection()?;
         let tx = transaction(&mut connection, TransactionBehavior::Immediate)?;
         let entries = {
-            let mut query=tx.prepare("SELECT id,body FROM replica_outbox WHERE state='pending' AND predecessor IS NULL ORDER BY rowid LIMIT ?1").map_err(sql_failed)?;
+            let mut query=tx.prepare("SELECT id,body FROM v3_outbox WHERE state='pending' AND predecessor IS NULL AND terminal_unknown_reason IS NULL ORDER BY rowid LIMIT ?1").map_err(sql_failed)?;
             query
                 .query_map(
                     [nddev_device_sync_application::replica::MAX_UPLOADS as u32],
@@ -26,7 +26,7 @@ impl Journal {
         for entry in &entries {
             changed += tx
                 .execute(
-                    "UPDATE replica_outbox SET dispatched=1 WHERE id=?1 AND dispatched=0",
+                    "UPDATE v3_outbox SET dispatched=1 WHERE id=?1 AND dispatched=0",
                     [&entry.id],
                 )
                 .map_err(sql_failed)?;
@@ -44,33 +44,107 @@ impl Journal {
         expected_revision: u64,
         expected_pending: Option<String>,
     ) -> Result<Enqueued, Error> {
+        self.enqueue_checked(
+            body,
+            expected_cursor,
+            expected_revision,
+            expected_pending,
+            None,
+            None,
+        )
+    }
+    /// Ordinary captured observations only. Conflict-only resolution awaits
+    /// Root's combined outer lifecycle/atomic transition; no bypass here.
+    pub fn enqueue_observation(
+        &self,
+        body: Vec<u8>,
+        expected_revision: u64,
+        expected_pending: Option<String>,
+        selected: &nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+        selected_operation: &[u8],
+    ) -> Result<Enqueued, Error> {
+        self.enqueue_checked(
+            body,
+            None,
+            expected_revision,
+            expected_pending,
+            Some((selected, selected_operation)),
+            None,
+        )
+    }
+    pub(crate) fn enqueue_writer(
+        &self,
+        body: Vec<u8>,
+        expected_cursor: Option<u64>,
+        expected_revision: u64,
+        expected_pending: Option<String>,
+        writer: &WriterEnqueueGuard,
+    ) -> Result<Enqueued, Error> {
+        self.enqueue_checked(
+            body,
+            expected_cursor,
+            expected_revision,
+            expected_pending,
+            None,
+            Some(writer),
+        )
+    }
+    fn enqueue_checked(
+        &self,
+        body: Vec<u8>,
+        expected_cursor: Option<u64>,
+        expected_revision: u64,
+        expected_pending: Option<String>,
+        selected: Option<(
+            &nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+            &[u8],
+        )>,
+        writer: Option<&WriterEnqueueGuard>,
+    ) -> Result<Enqueued, Error> {
         if body.len() > 24576 {
             return Err(Error::Invalid);
         }
-        let operation: wire::SyncOperation =
-            serde_json::from_slice(&body).map_err(|_| Error::Invalid)?;
-        crate::codec::operation(&operation, body.len())?;
-        let kind = kind(&operation.entity_type);
+        let versioned = crate::codec::versioned(&body)?;
+        let operation = &versioned.operation;
+        let kind = operation.entity_kind.as_str();
         let mut connection = self.connection()?;
         let tx = transaction(&mut connection, TransactionBehavior::Immediate)?;
+        if let Some(writer) = writer {
+            writer::guard_enqueue(&tx, writer, &versioned)?;
+        }
+        if let Some((selected, selected_operation)) = selected {
+            if kind != "repository_state" {
+                return Err(Error::Invalid);
+            }
+            let source = reads::selected_current(&tx, selected)?;
+            if source.body != selected_operation {
+                return Err(Error::SelectionChanged);
+            }
+        }
         let entity = reads::entity(&tx, kind, &operation.entity_id)?;
+        if versioned.version == nddev_device_sync_domain::sync::history::OperationVersion::V2
+            && entity.as_ref().is_some_and(|e| {
+                crate::codec::versioned(&e.body).is_ok_and(|o| {
+                    o.version != nddev_device_sync_domain::sync::history::OperationVersion::V2
+                })
+            })
+        {
+            return Err(Error::Invalid);
+        }
         let revision = entity.as_ref().map_or(0, |e| e.revision);
         let pending = entity.as_ref().and_then(|e| e.pending_id.clone());
         let base = entity.as_ref().map_or(0, |e| e.next_base);
         if revision != expected_revision
             || pending != expected_pending
-            || operation.base_revision < 0
-            || operation.base_revision as u64 != base
+            || operation.base_revision != base
         {
             return Err(Error::Busy);
         }
         if let Some(expected) = expected_cursor {
             let actual: u64 = tx
-                .query_row(
-                    "SELECT cursor FROM replica_meta WHERE singleton=1",
-                    [],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT cursor FROM v3_meta WHERE singleton=1", [], |r| {
+                    r.get(0)
+                })
                 .map_err(sql_failed)?;
             if actual != expected
                 || kind != "vault_record"
@@ -80,17 +154,17 @@ impl Journal {
             }
             // An unacknowledged dispatched operation is still immutable. The
             // user must observe its server outcome before resolving the family.
-            let in_flight:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM replica_outbox WHERE kind=?1 AND entity_id=?2 AND dispatched=1)",params![kind,operation.entity_id],|r|r.get(0)).map_err(sql_failed)?;
+            let in_flight:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM v3_outbox WHERE kind=?1 AND entity_id=?2 AND dispatched=1)",params![kind,operation.entity_id],|r|r.get(0)).map_err(sql_failed)?;
             if in_flight {
                 return Err(Error::Busy);
             }
         } else if entity.as_ref().is_some_and(|e| e.conflicted) {
             return Err(Error::Busy);
         }
-        let old:Option<(String,u32,Option<String>)>=tx.query_row("SELECT id,dispatched,predecessor FROM replica_outbox WHERE kind=?1 AND entity_id=?2 ORDER BY rowid DESC LIMIT 1",params![kind,operation.entity_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(sql_failed)?;
+        let old:Option<(String,u32,Option<String>)>=tx.query_row("SELECT id,dispatched,predecessor FROM v3_outbox WHERE kind=?1 AND entity_id=?2 ORDER BY rowid DESC LIMIT 1",params![kind,operation.entity_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(sql_failed)?;
         let predecessor = match old {
             Some((id, 0, predecessor)) => {
-                tx.execute("DELETE FROM replica_outbox WHERE id=?1", [id])
+                tx.execute("DELETE FROM v3_outbox WHERE id=?1", [id])
                     .map_err(sql_failed)?;
                 predecessor
             }
@@ -98,50 +172,112 @@ impl Journal {
             None => None,
         };
         let count: u64 = tx
-            .query_row("SELECT count(*) FROM replica_outbox", [], |r| r.get(0))
+            .query_row("SELECT count(*) FROM v3_outbox", [], |r| r.get(0))
             .map_err(sql_failed)?;
         if count >= 1024 {
             return Err(Error::Busy);
         }
-        tx.execute("INSERT INTO replica_outbox(id,kind,entity_id,body,state,dispatched,predecessor) VALUES(?1,?2,?3,?4,'pending',0,?5)",params![operation.operation_id,kind,operation.entity_id,body,predecessor]).map_err(sql_failed)?;
+        tx.execute("INSERT INTO v3_outbox(id,kind,entity_id,body,state,dispatched,predecessor) VALUES(?1,?2,?3,?4,'pending',0,?5)",params![operation.id,kind,operation.entity_id,body,predecessor]).map_err(sql_failed)?;
         bump(&tx)?;
-        let receipt=tx.query_row("SELECT (SELECT count(*) FROM replica_outbox WHERE state='pending'),((SELECT count(*) FROM replica_conflicts)+(SELECT count(*) FROM replica_outbox o WHERE state='conflict' AND NOT EXISTS(SELECT 1 FROM replica_conflicts c WHERE c.kind=o.kind AND c.entity_id=o.entity_id))),cursor,local_revision FROM replica_meta WHERE singleton=1",[],|r|Ok(Enqueued{id:operation.operation_id.clone(),pending:r.get(0)?,conflicts:r.get(1)?,cursor:r.get(2)?,local_revision:r.get(3)?})).map_err(sql_failed)?;
+        let receipt=tx.query_row("SELECT (SELECT count(*) FROM v3_outbox WHERE state='pending'),((SELECT count(*) FROM v3_conflicts)+(SELECT count(*) FROM v3_outbox o WHERE state='conflict' AND NOT EXISTS(SELECT 1 FROM v3_conflicts c WHERE c.kind=o.kind AND c.entity_id=o.entity_id))),cursor,local_revision FROM v3_meta WHERE singleton=1",[],|r|Ok(Enqueued{id:operation.id.clone(),pending:r.get(0)?,conflicts:r.get(1)?,cursor:r.get(2)?,local_revision:r.get(3)?})).map_err(sql_failed)?;
         tx.commit().map_err(sql_failed)?;
         Ok(receipt)
     }
     pub fn acknowledge(&self, request: &[u8], result: &[u8], resolved: u64) -> Result<(), Error> {
-        let operation: wire::SyncOperation =
-            serde_json::from_slice(request).map_err(|_| Error::Invalid)?;
-        crate::codec::operation(&operation, request.len())?;
         let outcome: wire::Sync = serde_json::from_slice(result).map_err(|_| Error::Invalid)?;
-        let outcome_id = match &outcome {
-            wire::Sync::Applied(v) => &v.operation_id,
-            wire::Sync::Conflict(v) => &v.operation_id,
+        let status = match crate::codec::receipt(&outcome)?.decision {
+            nddev_device_sync_domain::sync::Decision::Apply { .. } => 201,
+            _ => 409,
         };
-        if outcome_id != &operation.operation_id {
-            return Err(Error::Invalid);
-        }
+        self.acknowledge_original(request, result, status, resolved)
+    }
+    pub(crate) fn acknowledge_original(
+        &self,
+        request: &[u8],
+        result: &[u8],
+        status: u16,
+        resolved: u64,
+    ) -> Result<(), Error> {
+        let (operation, receipt) = crate::codec::original_receipt(request, result, status)?;
         let mut connection = self.connection()?;
         let tx = transaction(&mut connection, TransactionBehavior::Immediate)?;
         let body: Option<Vec<u8>> = tx
             .query_row(
-                "SELECT body FROM replica_outbox WHERE id=?1 AND dispatched=1",
-                [&operation.operation_id],
+                "SELECT body FROM v3_outbox WHERE id=?1 AND dispatched=1",
+                [&operation.operation.id],
                 |r| r.get(0),
             )
             .optional()
             .map_err(sql_failed)?;
         if let Some(body) = body {
-            // The response belongs to the exact claimed POST, including its
-            // device. An ID alone cannot acknowledge a replacement request.
             if body != request {
                 return Err(Error::Invalid);
             }
-            apply(&tx, &operation, &body, &outcome, result, resolved)?;
-            settle(&tx, &operation, &outcome)?;
+            let row = RawRow {
+                legacy_resolved: match operation.version {
+                    nddev_device_sync_domain::sync::history::OperationVersion::V2 => resolved,
+                    nddev_device_sync_domain::sync::history::OperationVersion::V3 { .. } => 0,
+                },
+                body,
+                result: result.to_vec(),
+                status,
+                sequence: receipt.server_seq,
+            };
+            apply_row(&tx, &row)?;
+            settle_row(&tx, &row)?;
             bump(&tx)?;
         }
-        // Another process may already have ingested this exact server receipt.
+        tx.execute(
+            "UPDATE v3_meta SET known_committed_seq=MAX(known_committed_seq,?1) WHERE singleton=1",
+            [receipt.server_seq],
+        )
+        .map_err(sql_failed)?;
+        tx.commit().map_err(sql_failed)
+    }
+    pub(crate) fn ingest_original(
+        &self,
+        header: nddev_device_sync_domain::sync::history::HistoryVersion,
+        after: u64,
+        rows: &[RawRow],
+        next: u64,
+        more: bool,
+    ) -> Result<(), Error> {
+        use nddev_device_sync_domain::sync::history;
+        let head = header.head;
+        let floor = header.floor;
+        header.validate().map_err(|_| Error::Invalid)?;
+        if next > head || more != (next < head) {
+            return Err(Error::Invalid);
+        }
+        let mut connection = self.connection()?;
+        let tx = transaction(&mut connection, TransactionBehavior::Immediate)?;
+        let cursor: u64 = tx
+            .query_row("SELECT cursor FROM v3_meta WHERE singleton=1", [], |r| {
+                r.get(0)
+            })
+            .map_err(sql_failed)?;
+        if cursor != after {
+            return Err(Error::Busy);
+        }
+        if cursor < floor {
+            return Err(Error::Invalid);
+        }
+        history::delta_progress(
+            cursor,
+            &rows.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+            next,
+            more,
+        )
+        .map_err(|_| Error::Invalid)?;
+        for row in rows {
+            apply_row(&tx, row)?;
+            settle_row(&tx, row)?;
+        }
+        if !rows.is_empty() {
+            bump(&tx)?;
+        }
+        tx.execute("UPDATE v3_meta SET cursor=?1 WHERE singleton=1", [next])
+            .map_err(sql_failed)?;
         tx.commit().map_err(sql_failed)
     }
     pub fn ingest(&self, page: &wire::SyncPage, resolutions: &[u64]) -> Result<(), Error> {
@@ -154,11 +290,9 @@ impl Journal {
         let mut connection = self.connection()?;
         let tx = transaction(&mut connection, TransactionBehavior::Immediate)?;
         let mut previous: i64 = tx
-            .query_row(
-                "SELECT cursor FROM replica_meta WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT cursor FROM v3_meta WHERE singleton=1", [], |r| {
+                r.get(0)
+            })
             .map_err(sql_failed)?;
         for (entry, resolved) in page.entries.iter().zip(resolutions) {
             let seq = match &entry.result {
@@ -190,11 +324,8 @@ impl Journal {
         if !page.entries.is_empty() {
             bump(&tx)?;
         }
-        tx.execute(
-            "UPDATE replica_meta SET cursor=?1 WHERE singleton=1",
-            [previous],
-        )
-        .map_err(sql_failed)?;
+        tx.execute("UPDATE v3_meta SET cursor=?1 WHERE singleton=1", [previous])
+            .map_err(sql_failed)?;
         tx.commit().map_err(sql_failed)
     }
 }
@@ -205,9 +336,7 @@ fn settle(
 ) -> Result<(), Error> {
     let id = &operation.operation_id;
     let pending: Option<Vec<u8>> = tx
-        .query_row("SELECT body FROM replica_outbox WHERE id=?1", [id], |r| {
-            r.get(0)
-        })
+        .query_row("SELECT body FROM v3_outbox WHERE id=?1", [id], |r| r.get(0))
         .optional()
         .map_err(sql_failed)?;
     let Some(pending) = pending else {
@@ -225,20 +354,75 @@ fn settle(
         "conflict"
     };
     tx.execute(
-        "UPDATE replica_outbox SET predecessor=NULL,state=?1 WHERE predecessor=?2",
+        "UPDATE v3_outbox SET predecessor=NULL,state=?1 WHERE predecessor=?2",
         params![state, id],
     )
     .map_err(sql_failed)?;
-    tx.execute("DELETE FROM replica_outbox WHERE id=?1", [id])
+    tx.execute("DELETE FROM v3_outbox WHERE id=?1", [id])
         .map_err(sql_failed)?;
     Ok(())
 }
 
 fn bump(tx: &rusqlite::Transaction<'_>) -> Result<(), Error> {
     tx.execute(
-        "UPDATE replica_meta SET local_revision=local_revision+1 WHERE singleton=1",
+        "UPDATE v3_meta SET local_revision=local_revision+1 WHERE singleton=1",
         [],
     )
     .map_err(sql_failed)?;
+    Ok(())
+}
+
+pub(super) fn apply_row(tx: &rusqlite::Transaction<'_>, row: &RawRow) -> Result<(), Error> {
+    let (operation, receipt) = row.decode()?;
+    match operation.version {
+        nddev_device_sync_domain::sync::history::OperationVersion::V2 => {
+            let wire: wire::SyncOperation =
+                serde_json::from_slice(&row.body).map_err(|_| Error::Invalid)?;
+            let outcome: wire::Sync =
+                serde_json::from_slice(&row.result).map_err(|_| Error::Invalid)?;
+            apply(
+                tx,
+                &wire,
+                &row.body,
+                &outcome,
+                &row.result,
+                row.legacy_resolved,
+            )?;
+        }
+        nddev_device_sync_domain::sync::history::OperationVersion::V3 { .. } => {
+            checkpoint::apply_original(tx, row)?
+        }
+    }
+    tx.execute(
+        "UPDATE v3_meta SET known_committed_seq=MAX(known_committed_seq,?1) WHERE singleton=1",
+        [receipt.server_seq],
+    )
+    .map_err(sql_failed)?;
+    Ok(())
+}
+fn settle_row(tx: &rusqlite::Transaction<'_>, row: &RawRow) -> Result<(), Error> {
+    let (operation, receipt) = row.decode()?;
+    let id = &operation.operation.id;
+    let pending: Option<Vec<u8>> = tx
+        .query_row("SELECT body FROM v3_outbox WHERE id=?1", [id], |r| r.get(0))
+        .optional()
+        .map_err(sql_failed)?;
+    let Some(pending) = pending else {
+        return Ok(());
+    };
+    if !checkpoint::same_original(&pending, &row.body)? {
+        return Ok(());
+    }
+    let state = match receipt.decision {
+        nddev_device_sync_domain::sync::Decision::Apply { .. } => "pending",
+        _ => "conflict",
+    };
+    tx.execute(
+        "UPDATE v3_outbox SET predecessor=NULL,state=?1 WHERE predecessor=?2",
+        params![state, id],
+    )
+    .map_err(sql_failed)?;
+    tx.execute("DELETE FROM v3_outbox WHERE id=?1", [id])
+        .map_err(sql_failed)?;
     Ok(())
 }
