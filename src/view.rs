@@ -83,6 +83,8 @@ pub enum VaultError {
     Unavailable,
     #[error("vault_busy")]
     Busy,
+    #[error("vault_selection_changed")]
+    SelectionChanged,
     #[error("vault_storage_full")]
     StorageFull,
     #[error("sync_capacity_exhausted")]
