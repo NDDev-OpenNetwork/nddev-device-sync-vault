@@ -74,7 +74,7 @@ impl VaultClient {
             &self.scope.device,
         ))
         .map_err(dependency)?;
-        Ok(format!("{:x}", Sha256::digest(encoded)))
+        Ok(base16ct::lower::encode_string(&Sha256::digest(encoded)))
     }
     pub async fn begin_checkpoint(
         &self,
@@ -94,7 +94,7 @@ impl VaultClient {
             &self.scope.device,
         ))
         .map_err(dependency)?;
-        let scope_tag = format!("{:x}", Sha256::digest(encoded));
+        let scope_tag = base16ct::lower::encode_string(&Sha256::digest(encoded));
         self.identity
             .validate_local_use(&fence)
             .await
