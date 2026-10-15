@@ -28,6 +28,8 @@ struct Expected {
     revision: u64,
     resolution: Option<crate::journal::ResolutionGuard>,
     pending: Option<String>,
+    observed_base: Option<u64>,
+    observation: Option<repository::SourceGuard>,
 }
 enum ReadRecord {
     Legacy(Record),
@@ -74,6 +76,7 @@ fn dependency<E>(_: E) -> Error {
 fn identity_failure(error: nddev_device_sync_accounts::ClientError) -> Error {
     use nddev_device_sync_accounts::ClientError;
     match error {
+        ClientError::Cancelled => Error::Cancelled,
         ClientError::Busy => Error::Busy,
         ClientError::Server(code) if code == "server_busy" => Error::Busy,
         ClientError::Server(code) if code == "sync_capacity_exhausted" => Error::CapacityExhausted,
@@ -275,11 +278,18 @@ impl VaultClient {
         if plaintext.len() > MAX_PLAIN_BYTES {
             return Err(Error::Invalid);
         }
-        let fence = self
-            .identity
-            .local_use_fence()
-            .await
-            .map_err(identity_failure)?;
+        let fence = match expected.as_ref().and_then(|e| e.observation.as_ref()) {
+            Some(source) => {
+                source.check()?;
+                source.fence.clone()
+            }
+            None => Arc::new(
+                self.identity
+                    .local_use_fence()
+                    .await
+                    .map_err(identity_failure)?,
+            ),
+        };
         let key = self.key().await?.ok_or(Error::Locked)?;
         let capture = match self
             .journal
@@ -300,11 +310,14 @@ impl VaultClient {
         let pending = existing
             .as_ref()
             .and_then(|entity| entity.pending_id.clone());
-        let base = existing.as_ref().map_or(0, |entity| entity.next_base);
-        if expected
-            .as_ref()
-            .is_some_and(|expected| expected.revision != revision || expected.pending != pending)
-        {
+        let observed_base = existing.as_ref().map_or(0, |entity| entity.next_base);
+        if expected.as_ref().is_some_and(|expected| {
+            expected.revision != revision
+                || expected.pending != pending
+                || expected
+                    .observed_base
+                    .is_some_and(|value| value != observed_base)
+        }) {
             return Err(Error::Busy);
         }
         let resolution = expected
@@ -318,6 +331,13 @@ impl VaultClient {
             return Err(Error::Busy);
         }
         let expected_cursor = resolution.map(|guard| guard.cursor);
+        // An explicit resolution is a new choice against the committed head;
+        // the retained pending original's base remains part of its CAS evidence.
+        let base = if resolution.is_some() {
+            revision
+        } else {
+            observed_base
+        };
         let operation_id = uuid::Uuid::new_v4().to_string();
         let operation = Operation {
             id: operation_id.clone(),
@@ -395,19 +415,53 @@ impl VaultClient {
             .validate_local_use(&fence)
             .await
             .map_err(identity_failure)?;
-        let receipt = match self
-            .journal
-            .call(crate::storage::Command::EnqueueWriter {
+        let writer = crate::journal::WriterEnqueueGuard {
+            facts: capture.writer.facts,
+            actual_key_id: key.id(),
+            basis_seq,
+            expected_local_revision: resolution.map(|guard| guard.local_revision),
+        };
+        let command = match (
+            expected.as_ref().and_then(|e| e.observation.as_ref()),
+            resolution,
+        ) {
+            (Some(source), Some(resolution)) => {
+                crate::storage::Command::EnqueueResolvedObservation {
+                    body: bytes,
+                    expected_revision: revision,
+                    expected_pending: pending,
+                    selected: source.selection.clone(),
+                    selected_operation: source.operation.clone(),
+                    writer,
+                    resolution: resolution.clone(),
+                }
+            }
+            (Some(source), None) => crate::storage::Command::EnqueueObservedWriter {
+                body: bytes,
+                expected_revision: revision,
+                expected_pending: pending,
+                selected: source.selection.clone(),
+                selected_operation: source.operation.clone(),
+                writer,
+            },
+            (None, _) => crate::storage::Command::EnqueueWriter {
                 body: bytes,
                 expected_cursor,
                 expected_revision: revision,
                 expected_pending: pending,
-                writer: crate::journal::WriterEnqueueGuard {
-                    facts: capture.writer.facts,
-                    actual_key_id: key.id(),
-                    basis_seq,
-                    expected_local_revision: resolution.map(|guard| guard.local_revision),
-                },
+                writer,
+            },
+        };
+        let receipt = match self
+            .journal
+            .call_guarded(command, || {
+                if let Some(source) = expected.as_ref().and_then(|e| e.observation.as_ref()) {
+                    source.check()?;
+                    self.identity
+                        .check_local_use_lifetime(&source.fence)
+                        .map_err(identity_failure)?;
+                }
+                Ok(())
             })
             .await?
         {
@@ -519,6 +573,8 @@ impl VaultClient {
                 revision: expected_revision,
                 resolution: None,
                 pending: expected_pending,
+                observed_base: None,
+                observation: None,
             }),
         )
         .await
@@ -733,6 +789,8 @@ impl VaultClient {
                 revision: expected_revision,
                 resolution: Some(resolution),
                 pending: expected_pending,
+                observed_base: None,
+                observation: None,
             }),
         )
         .await
@@ -771,6 +829,8 @@ impl VaultClient {
                 revision: expected_revision,
                 resolution: None,
                 pending: expected_pending,
+                observed_base: None,
+                observation: None,
             }),
         )
         .await
@@ -1759,3 +1819,10 @@ pub use checkpoint::CheckpointStage;
 
 #[path = "history_replica.rs"]
 pub(crate) mod history_replica;
+
+#[path = "repository_client.rs"]
+mod repository;
+pub use repository::{
+    RepositoryCatalogCursor, RepositoryCatalogPage, RepositoryPublication, RepositoryRead,
+    RepositoryResolution, RetainedRepositoryObservation,
+};

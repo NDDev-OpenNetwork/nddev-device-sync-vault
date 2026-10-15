@@ -102,15 +102,41 @@ pub(crate) enum Command {
     ObservationTarget {
         id: String,
     },
+    ObservationResolution {
+        id: String,
+        selected: nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+        selected_operation: Vec<u8>,
+    },
+    RepositoryPage {
+        after: String,
+    },
+    RepositoryOwners {
+        ids: Vec<String>,
+        expected: u64,
+    },
     ObservationBaselines {
         selected: nddev_device_sync_domain::repositories::catalog::CredentialSelection,
     },
-    EnqueueObservation {
+    // A distinct IPC command makes older workers reject the combined guard
+    // instead of silently ignoring an added field on the old command.
+    EnqueueObservedWriter {
         body: Vec<u8>,
         expected_revision: u64,
         expected_pending: Option<String>,
         selected: nddev_device_sync_domain::repositories::catalog::CredentialSelection,
         selected_operation: Vec<u8>,
+        writer: crate::journal::WriterEnqueueGuard,
+    },
+    // Distinct command: an older worker must reject a resolver, never ignore
+    // added fields and treat it as an ordinary observation enqueue.
+    EnqueueResolvedObservation {
+        body: Vec<u8>,
+        expected_revision: u64,
+        expected_pending: Option<String>,
+        selected: nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+        selected_operation: Vec<u8>,
+        writer: crate::journal::WriterEnqueueGuard,
+        resolution: crate::journal::ResolutionGuard,
     },
     Entity {
         kind: String,
@@ -170,8 +196,12 @@ impl Command {
             Self::Pending => "vault.storage.claim",
             Self::Cursor => "vault.storage.cursor",
             Self::ObservationTarget { .. } => "vault.storage.observation_target",
+            Self::ObservationResolution { .. } => "vault.storage.observation_resolution",
+            Self::RepositoryPage { .. } => "vault.storage.repository_page",
+            Self::RepositoryOwners { .. } => "vault.storage.repository_owners",
             Self::ObservationBaselines { .. } => "vault.storage.observation_baselines",
-            Self::EnqueueObservation { .. } => "vault.storage.enqueue_observation",
+            Self::EnqueueObservedWriter { .. } => "vault.storage.enqueue_observation",
+            Self::EnqueueResolvedObservation { .. } => "vault.storage.resolve_observation",
             Self::Entity { .. } => "vault.storage.entity",
             Self::Records { .. } => "vault.storage.records",
             Self::Resolution { .. } => "vault.storage.resolution",
@@ -193,6 +223,9 @@ fn completed(
         Ok(_) => {
             tracing::event!(target:"nddev_device_sync_vault",tracing::Level::INFO,{event.name=event,outcome="ok",duration_ms=started.elapsed().as_millis() as u64})
         }
+        Err(Error::Cancelled) => {
+            tracing::event!(target:"nddev_device_sync_vault",tracing::Level::INFO,{event.name=event,outcome="stopped",error.type="vault_cancelled",duration_ms=started.elapsed().as_millis() as u64})
+        }
         Err(error) => {
             tracing::event!(target:"nddev_device_sync_vault",tracing::Level::WARN,{event.name=event,outcome="error",error.type=error.code(),duration_ms=started.elapsed().as_millis() as u64})
         }
@@ -211,6 +244,8 @@ pub(crate) enum Reply {
     Cursor(u64),
     ObservationBaselines(ObservationBaselines),
     ObservationTarget(ObservationTarget),
+    ObservationResolution(crate::journal::ObservationResolution),
+    CatalogRows(crate::journal::CatalogRows),
     Entity(Option<Entity>),
     Records(Vec<RecordEntry>, u64, u64),
     Resolution(Entity, Option<Vec<u8>>, crate::journal::ResolutionGuard),
@@ -223,6 +258,35 @@ pub(crate) enum Reply {
 
 pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Error> {
     Ok(match command {
+        Command::EnqueueResolvedObservation {
+            body,
+            expected_revision,
+            expected_pending,
+            selected,
+            selected_operation,
+            writer,
+            resolution,
+        } => Reply::Enqueued(journal.enqueue_observation_resolution(
+            body,
+            expected_revision,
+            expected_pending,
+            (&selected, &selected_operation),
+            &writer,
+            &resolution,
+        )?),
+        Command::ObservationResolution {
+            id,
+            selected,
+            selected_operation,
+        } => Reply::ObservationResolution(journal.observation_resolution(
+            &id,
+            &selected,
+            &selected_operation,
+        )?),
+        Command::RepositoryPage { after } => Reply::CatalogRows(journal.repository_page(&after)?),
+        Command::RepositoryOwners { ids, expected } => {
+            Reply::CatalogRows(journal.repository_owners(&ids, expected)?)
+        }
         Command::EditTarget { kind, id, known } => {
             Reply::EditTarget(journal.edit_target(&kind, &id, known)?)
         }
@@ -348,18 +412,20 @@ pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Erro
         Command::ObservationBaselines { selected } => {
             Reply::ObservationBaselines(journal.observation_baselines(&selected)?)
         }
-        Command::EnqueueObservation {
+        Command::EnqueueObservedWriter {
             body,
             expected_revision,
             expected_pending,
             selected,
             selected_operation,
+            writer,
         } => Reply::Enqueued(journal.enqueue_observation(
             body,
             expected_revision,
             expected_pending,
             &selected,
             &selected_operation,
+            &writer,
         )?),
         Command::Entity { kind, id } => Reply::Entity(journal.entity(&kind, &id)?),
         Command::Records { after } => {
@@ -436,6 +502,15 @@ impl Storage {
         }
     }
     pub(crate) async fn call(&self, command: Command) -> Result<Reply, Error> {
+        self.call_guarded(command, || Ok(())).await
+    }
+    /// Synchronous caller guard after admission, before any transaction starts.
+    /// It is not serialized to the worker and must perform no I/O.
+    pub(crate) async fn call_guarded(
+        &self,
+        command: Command,
+        check: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<Reply, Error> {
         let event = command.event();
         let span = nddev_device_sync_telemetry::operation_span("vault", "io")
             .map_err(|_| Error::Unavailable)?;
@@ -453,9 +528,14 @@ impl Storage {
             std::time::Duration::from_millis(500),
             self.io.clone().acquire_owned(),
         )
-        .await
-        .map_err(|_| Error::Busy)?
-        .map_err(|_| Error::Unavailable)?;
+        .await;
+        if let Err(error) = check() {
+            span.in_scope(|| completed(event, started, &Err(error)));
+            return Err(error);
+        }
+        let permit = permit
+            .map_err(|_| Error::Busy)?
+            .map_err(|_| Error::Unavailable)?;
         #[cfg(not(target_arch = "wasm32"))]
         {
             let journal = self.journal.clone();
@@ -577,5 +657,60 @@ impl Storage {
     #[cfg(all(test, not(target_arch = "wasm32")))]
     pub fn path_for_acceptance(&self) -> PathBuf {
         self.journal.path_for_acceptance()
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_guard_after_queue_wait_cannot_start_a_transaction() {
+        struct Owned(PathBuf);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = Owned(
+            std::env::temp_dir().join(format!("nds-storage-admission-{}", uuid::Uuid::new_v4())),
+        );
+        let storage = Arc::new(Storage::open(directory.0.join("replica.db")).await.unwrap());
+        let held = storage.io.clone().acquire_owned().await.unwrap();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancelled = cancellation.clone();
+        let queued = storage.clone();
+        let task = tokio::spawn(async move {
+            queued
+                .call_guarded(Command::CaughtUp { cursor: 0, at: 77 }, || {
+                    if cancelled.is_cancelled() {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while storage.admission.available_permits() == 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancellation.cancel();
+        drop(held);
+        assert!(matches!(task.await.unwrap(), Err(Error::Cancelled)));
+        assert_eq!(storage.journal.stats().unwrap().3, 0);
+        assert_eq!(storage.io.available_permits(), 1);
+        assert_eq!(storage.admission.available_permits(), 4);
+        assert!(matches!(
+            storage
+                .call(Command::CaughtUp { cursor: 0, at: 77 })
+                .await
+                .unwrap(),
+            Reply::Bool(true)
+        ));
+        assert_eq!(storage.journal.stats().unwrap().3, 77);
     }
 }
