@@ -310,11 +310,13 @@ impl VaultClient {
         let pending = existing
             .as_ref()
             .and_then(|entity| entity.pending_id.clone());
-        let base = existing.as_ref().map_or(0, |entity| entity.next_base);
+        let observed_base = existing.as_ref().map_or(0, |entity| entity.next_base);
         if expected.as_ref().is_some_and(|expected| {
             expected.revision != revision
                 || expected.pending != pending
-                || expected.observed_base.is_some_and(|value| value != base)
+                || expected
+                    .observed_base
+                    .is_some_and(|value| value != observed_base)
         }) {
             return Err(Error::Busy);
         }
@@ -329,6 +331,13 @@ impl VaultClient {
             return Err(Error::Busy);
         }
         let expected_cursor = resolution.map(|guard| guard.cursor);
+        // An explicit resolution is a new choice against the committed head;
+        // the retained pending original's base remains part of its CAS evidence.
+        let base = if resolution.is_some() {
+            revision
+        } else {
+            observed_base
+        };
         let operation_id = uuid::Uuid::new_v4().to_string();
         let operation = Operation {
             id: operation_id.clone(),
@@ -412,8 +421,22 @@ impl VaultClient {
             basis_seq,
             expected_local_revision: resolution.map(|guard| guard.local_revision),
         };
-        let command = match expected.as_ref().and_then(|e| e.observation.as_ref()) {
-            Some(source) => crate::storage::Command::EnqueueObservedWriter {
+        let command = match (
+            expected.as_ref().and_then(|e| e.observation.as_ref()),
+            resolution,
+        ) {
+            (Some(source), Some(resolution)) => {
+                crate::storage::Command::EnqueueResolvedObservation {
+                    body: bytes,
+                    expected_revision: revision,
+                    expected_pending: pending,
+                    selected: source.selection.clone(),
+                    selected_operation: source.operation.clone(),
+                    writer,
+                    resolution: resolution.clone(),
+                }
+            }
+            (Some(source), None) => crate::storage::Command::EnqueueObservedWriter {
                 body: bytes,
                 expected_revision: revision,
                 expected_pending: pending,
@@ -421,7 +444,7 @@ impl VaultClient {
                 selected_operation: source.operation.clone(),
                 writer,
             },
-            None => crate::storage::Command::EnqueueWriter {
+            (None, _) => crate::storage::Command::EnqueueWriter {
                 body: bytes,
                 expected_cursor,
                 expected_revision: revision,

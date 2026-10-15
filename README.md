@@ -126,5 +126,10 @@ conflict original/receipt and any undispatched local intent after reopen. All
 scoped receipts contribute to the existing resolution lifecycle; cursor values
 are not substituted for witnesses. Dispatched families are refused until their
 real outcome is known. Captured evidence does not itself resolve or delete a
-conflict; fresh provider input and the confirmed resolution transaction are
-separate requirements.
+conflict. `resolve_repository_observation` confirms fresh provider input through
+Core, then queues a new operation against the observed committed revision. Its
+separate storage command rechecks source, writer, cursor/local revision and all
+scoped lifecycle witnesses together. The old conflict survives queueing/reopen
+and another Conflict receipt; only the actual Applied receipt retires it.
+Blocked-only intents have no server conflict receipt and still need their own
+explicit transition. The automatic catalog caller has not yet adopted resolution.

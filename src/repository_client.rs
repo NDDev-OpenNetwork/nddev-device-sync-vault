@@ -5,11 +5,12 @@ use super::*;
 use nddev_device_sync_accounts::LocalUseFence;
 use nddev_device_sync_domain::repositories::catalog::observations::{
     Candidate, ObservationContext, ObservationKey, ObservedTarget, PublicationDecision,
-    RepositoryObservation, TargetVersion,
+    RepositoryObservation, ResolutionDecision, ResolutionRead, TargetVersion,
 };
 use nddev_device_sync_domain::sync::history::VersionedOperation;
 use std::collections::BTreeMap;
 
+#[derive(Clone)]
 pub(super) struct SourceGuard {
     pub(super) selection: CredentialSelection,
     pub(super) operation: Vec<u8>,
@@ -473,6 +474,96 @@ impl VaultClient {
         })
     }
 
+    /// Resolve a known retained family only with fresh provider input confirmed
+    /// by Core. Equal material still queues a lifecycle-bearing operation; the
+    /// old conflicts remain until its actual Applied receipt is observed.
+    pub async fn resolve_repository_observation(
+        &self,
+        resolution: &RepositoryResolution,
+        reread: ResolutionRead,
+        fresh: RepositoryObservation,
+        active: Option<&ObservationContext>,
+        observed_at_ms: u64,
+    ) -> Result<RepositoryPublication, Error> {
+        let _permit = self.admitted()?;
+        let read = &resolution.read;
+        read.source.check()?;
+        if active != Some(&fresh.source.context)
+            || fresh.source.context.selection != read.source.selection
+            || fresh.key() != resolution.current.key
+        {
+            return Ok(RepositoryPublication::SourceChanged);
+        }
+        // A blocked-only local intent has no retained conflict receipt. It must
+        // use its own explicit transition, never a fabricated KnownConflict.
+        let Some((_, receipt)) = &resolution.conflict else {
+            return Err(Error::Busy);
+        };
+        let candidate = reread.confirm(fresh.clone()).map_err(|_| Error::Invalid)?;
+        let current = self
+            .repository_observation_inner(read, &fresh.key())
+            .await?;
+        let writer = match self
+            .journal
+            .call(crate::storage::Command::WriterSnapshot)
+            .await?
+        {
+            crate::storage::Reply::WriterSnapshot(value) => value,
+            _ => return Err(Error::Invalid),
+        };
+        if writer.local_revision != resolution.guard.local_revision
+            || writer.cursor != resolution.guard.cursor
+            || resolution.guard.lifecycle.resolved_through_seq > writer.cursor
+        {
+            return Ok(RepositoryPublication::ReRead);
+        }
+        let guard = match candidate
+            .decide(&current, active)
+            .map_err(|_| Error::Invalid)?
+        {
+            ResolutionDecision::ReRead => return Ok(RepositoryPublication::ReRead),
+            ResolutionDecision::SourceChanged => return Ok(RepositoryPublication::SourceChanged),
+            ResolutionDecision::Equivalent(guard) | ResolutionDecision::Write { guard, .. } => {
+                guard
+            }
+        };
+        if !guard.matches(&resolution.current)
+            || guard.through_seq != receipt.server_seq
+            || guard.through_seq > resolution.guard.lifecycle.resolved_through_seq
+        {
+            return Err(Error::Invalid);
+        }
+        let id = fresh.key().entity_id();
+        let snapshot = Snapshot {
+            schema_version: 2,
+            observed_at_ms,
+            data: State::Repository { observation: fresh },
+        };
+        snapshot
+            .validate(
+                &DeviceId::new(&self.scope.device).map_err(dependency)?,
+                EntityKind::RepositoryState,
+                &id,
+            )
+            .map_err(|_| Error::Invalid)?;
+        let bytes = Zeroizing::new(serde_json::to_vec(&snapshot).map_err(dependency)?);
+        let operation_id = self
+            .put_inner(
+                EntityKind::RepositoryState,
+                id,
+                &bytes,
+                Some(Expected {
+                    revision: resolution.current.version.revision,
+                    pending: resolution.current.version.pending_id.clone(),
+                    observed_base: Some(resolution.current.version.next_base),
+                    resolution: Some(resolution.guard.clone()),
+                    observation: Some(read.source.clone()),
+                }),
+            )
+            .await?;
+        Ok(RepositoryPublication::Queued { operation_id })
+    }
+
     /// Read previous saved scope evidence under the original pre-provider guard.
     /// The result cannot replace that read's captured target version for writing.
     pub async fn repository_observation(
@@ -571,12 +662,7 @@ impl VaultClient {
                     pending: expected.pending_id,
                     resolution: None,
                     observed_base: Some(expected.next_base),
-                    observation: Some(SourceGuard {
-                        selection: read.source.selection.clone(),
-                        operation: read.source.operation.clone(),
-                        fence: read.source.fence.clone(),
-                        cancellation: read.source.cancellation.clone(),
-                    }),
+                    observation: Some(read.source.clone()),
                 }),
             )
             .await?;

@@ -327,7 +327,7 @@ fn read_catalog_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, Enti
 /// witnesses from one transaction. Only the latest original crosses IPC; all
 /// witnesses contribute to the existing lifecycle rule without loading a second
 /// complete ciphertext set into memory.
-fn resolution_evidence(
+pub(super) fn resolution_evidence(
     connection: &Connection,
     kind: &str,
     id: &str,

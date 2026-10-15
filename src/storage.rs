@@ -127,6 +127,17 @@ pub(crate) enum Command {
         selected_operation: Vec<u8>,
         writer: crate::journal::WriterEnqueueGuard,
     },
+    // Distinct command: an older worker must reject a resolver, never ignore
+    // added fields and treat it as an ordinary observation enqueue.
+    EnqueueResolvedObservation {
+        body: Vec<u8>,
+        expected_revision: u64,
+        expected_pending: Option<String>,
+        selected: nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+        selected_operation: Vec<u8>,
+        writer: crate::journal::WriterEnqueueGuard,
+        resolution: crate::journal::ResolutionGuard,
+    },
     Entity {
         kind: String,
         id: String,
@@ -190,6 +201,7 @@ impl Command {
             Self::RepositoryOwners { .. } => "vault.storage.repository_owners",
             Self::ObservationBaselines { .. } => "vault.storage.observation_baselines",
             Self::EnqueueObservedWriter { .. } => "vault.storage.enqueue_observation",
+            Self::EnqueueResolvedObservation { .. } => "vault.storage.resolve_observation",
             Self::Entity { .. } => "vault.storage.entity",
             Self::Records { .. } => "vault.storage.records",
             Self::Resolution { .. } => "vault.storage.resolution",
@@ -246,6 +258,22 @@ pub(crate) enum Reply {
 
 pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Error> {
     Ok(match command {
+        Command::EnqueueResolvedObservation {
+            body,
+            expected_revision,
+            expected_pending,
+            selected,
+            selected_operation,
+            writer,
+            resolution,
+        } => Reply::Enqueued(journal.enqueue_observation_resolution(
+            body,
+            expected_revision,
+            expected_pending,
+            (&selected, &selected_operation),
+            &writer,
+            &resolution,
+        )?),
         Command::ObservationResolution {
             id,
             selected,

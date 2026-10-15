@@ -821,3 +821,294 @@ fn blocked_only_capture_never_fabricates_a_conflict_receipt_or_raises_the_lifecy
     assert_eq!(capture.target.revision, 2);
     assert!(capture.target.conflicted);
 }
+
+fn resolution_fixture() -> (
+    Owned,
+    Journal,
+    VaultKey,
+    CredentialSelection,
+    ObservationBaselines,
+) {
+    let (owned, journal, key, selected, before) = setup();
+    journal
+        .enqueue_observation(
+            observed(&key, &selected, "local-intent"),
+            0,
+            None,
+            &selected,
+            &before.selected_operation,
+            &guard(&key, &before),
+        )
+        .unwrap();
+    let checkpoint = journal
+        .begin_checkpoint(&"c".repeat(64), &key.id(), 44, 2, 0)
+        .unwrap();
+    journal
+        .stage_base(
+            &checkpoint,
+            44,
+            2,
+            &[
+                retained_row(&key, &selected, "committed", 43, false),
+                retained_row(&key, &selected, "conflicted", 44, true),
+            ],
+            44,
+            false,
+        )
+        .unwrap();
+    journal
+        .stage_delta(&checkpoint, 44, &[], 44, false)
+        .unwrap();
+    journal.install_checkpoint(&checkpoint).unwrap();
+    (owned, journal, key, selected, before)
+}
+fn new_resolution_body(key: &VaultKey, selected: &CredentialSelection, resolved: u64) -> Vec<u8> {
+    let template = crate::codec::versioned(&observed(key, selected, "template")).unwrap();
+    let plain = key.decrypt_versioned(&scope(), &template).unwrap();
+    let mut snapshot: Snapshot = serde_json::from_slice(&plain).unwrap();
+    if let State::Repository { observation } = &mut snapshot.data {
+        observation.source.context.scan_id = "fresh-provider-scan".into();
+    }
+    let mut operation = template.operation;
+    operation.id = "fresh-resolution".into();
+    operation.idempotency_key = "fresh-resolution".into();
+    operation.base_revision = 1;
+    let mut resolver = VersionedOperation::qualify(
+        operation,
+        44,
+        Lifecycle {
+            resolved_through_seq: resolved,
+        },
+    )
+    .unwrap();
+    resolver.operation.payload = key
+        .encrypt_versioned(&scope(), &resolver, &serde_json::to_vec(&snapshot).unwrap())
+        .unwrap();
+    crate::codec::versioned_body(&resolver).unwrap()
+}
+fn resolution_writer(
+    journal: &Journal,
+    key: &VaultKey,
+    capture: &ObservationResolution,
+) -> WriterEnqueueGuard {
+    WriterEnqueueGuard {
+        facts: journal.writer_snapshot().unwrap().facts,
+        actual_key_id: key.id(),
+        basis_seq: Some(44),
+        expected_local_revision: Some(capture.guard.local_revision),
+    }
+}
+
+#[test]
+fn resolved_observation_is_durable_but_only_applied_receipt_retires_known_conflicts() {
+    for applied in [false, true] {
+        let (owned, journal, key, selected, before) = resolution_fixture();
+        let capture = journal
+            .observation_resolution("github:repo:9", &selected, &before.selected_operation)
+            .unwrap();
+        assert_eq!(capture.target.next_base, 0);
+        let original = capture.target.body.clone();
+        let body = new_resolution_body(&key, &selected, 44);
+        let writer = resolution_writer(&journal, &key, &capture);
+        let receipt = journal
+            .enqueue_observation_resolution(
+                body.clone(),
+                1,
+                capture.target.pending_id.clone(),
+                (&selected, &before.selected_operation),
+                &writer,
+                &capture.guard,
+            )
+            .unwrap();
+        assert_eq!(receipt.id, "v3:44:fresh-resolution");
+        assert_eq!(journal.stats().unwrap().1, 1);
+        let current = journal
+            .entity("repository_state", "github:repo:9")
+            .unwrap()
+            .unwrap();
+        assert!(current.conflicted);
+        assert_eq!(current.body, original);
+        assert_eq!(current.pending_id.as_deref(), Some(receipt.id.as_str()));
+        let reopened = Journal::open(owned.0.join("replica.db")).unwrap();
+        let claimed = reopened.pending().unwrap();
+        assert_eq!(
+            claimed.iter().find(|p| p.id == receipt.id).unwrap().body,
+            body
+        );
+        assert_eq!(
+            reopened
+                .pending()
+                .unwrap()
+                .iter()
+                .find(|p| p.id == receipt.id)
+                .unwrap()
+                .body,
+            body
+        );
+        let result = if applied {
+            wire::Sync::Applied(wire::SyncApplied {
+                operation_id: receipt.id,
+                outcome: wire::SyncAppliedOutcome::Applied,
+                revision: 2,
+                server_seq: 45,
+            })
+        } else {
+            wire::Sync::Conflict(wire::SyncConflict {
+                operation_id: receipt.id,
+                outcome: wire::SyncConflictOutcome::Conflict,
+                base_revision: 1,
+                current_revision: 2,
+                resolution_state: wire::ResolutionState::Unresolved,
+                server_seq: 45,
+            })
+        };
+        reopened
+            .acknowledge_original(
+                &body,
+                &serde_json::to_vec(&result).unwrap(),
+                if applied { 201 } else { 409 },
+                0,
+            )
+            .unwrap();
+        let current = reopened
+            .entity("repository_state", "github:repo:9")
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.conflicted, !applied);
+        assert_eq!(reopened.stats().unwrap().1, if applied { 0 } else { 2 });
+        assert_eq!(current.body, if applied { body } else { original });
+    }
+}
+
+#[test]
+fn resolved_observation_refuses_incomplete_witnesses_changed_source_and_dispatched_intent() {
+    let (_owned, journal, key, selected, before) = resolution_fixture();
+    let capture = journal
+        .observation_resolution("github:repo:9", &selected, &before.selected_operation)
+        .unwrap();
+    let writer = resolution_writer(&journal, &key, &capture);
+    let stats = journal.stats().unwrap();
+    let mut partial = capture.guard.clone();
+    partial.lifecycle.resolved_through_seq = 43;
+    assert!(matches!(
+        journal.enqueue_observation_resolution(
+            new_resolution_body(&key, &selected, 43),
+            1,
+            capture.target.pending_id.clone(),
+            (&selected, &before.selected_operation),
+            &writer,
+            &partial
+        ),
+        Err(Error::Busy)
+    ));
+    let mut wrong_source = before.selected_operation.clone();
+    wrong_source.push(b' ');
+    assert!(matches!(
+        journal.enqueue_observation_resolution(
+            new_resolution_body(&key, &selected, 44),
+            1,
+            capture.target.pending_id.clone(),
+            (&selected, &wrong_source),
+            &writer,
+            &capture.guard
+        ),
+        Err(Error::SelectionChanged)
+    ));
+    let mut missing = writer.clone();
+    missing.expected_local_revision = None;
+    assert!(matches!(
+        journal.enqueue_observation_resolution(
+            new_resolution_body(&key, &selected, 44),
+            1,
+            capture.target.pending_id.clone(),
+            (&selected, &before.selected_operation),
+            &missing,
+            &capture.guard
+        ),
+        Err(Error::Invalid)
+    ));
+    assert_eq!(journal.stats().unwrap(), stats);
+    let intent = journal
+        .entity("repository_state", "github:repo:9")
+        .unwrap()
+        .unwrap()
+        .pending_id
+        .unwrap();
+    let claimed = journal
+        .pending()
+        .unwrap()
+        .into_iter()
+        .find(|p| p.id == intent)
+        .unwrap()
+        .body;
+    let now = journal.writer_snapshot().unwrap();
+    let mut guard = capture.guard;
+    guard.local_revision = now.local_revision;
+    let writer = WriterEnqueueGuard {
+        facts: now.facts,
+        expected_local_revision: Some(now.local_revision),
+        ..writer
+    };
+    assert!(matches!(
+        journal.enqueue_observation_resolution(
+            new_resolution_body(&key, &selected, 44),
+            1,
+            Some(intent.clone()),
+            (&selected, &before.selected_operation),
+            &writer,
+            &guard
+        ),
+        Err(Error::Busy)
+    ));
+    assert_eq!(
+        journal
+            .pending()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == intent)
+            .unwrap()
+            .body,
+        claimed
+    );
+}
+
+#[test]
+fn resolution_command_cannot_lose_its_guard_or_downgrade_to_an_ordinary_write() {
+    let (_owned, journal, key, selected, before) = resolution_fixture();
+    let capture = journal
+        .observation_resolution("github:repo:9", &selected, &before.selected_operation)
+        .unwrap();
+    let command = crate::storage::Command::EnqueueResolvedObservation {
+        body: new_resolution_body(&key, &selected, 44),
+        expected_revision: 1,
+        expected_pending: capture.target.pending_id.clone(),
+        selected,
+        selected_operation: before.selected_operation,
+        writer: resolution_writer(&journal, &key, &capture),
+        resolution: capture.guard,
+    };
+    let mut encoded = serde_json::to_value(command).unwrap();
+    let payload = encoded
+        .as_object_mut()
+        .unwrap()
+        .remove("EnqueueResolvedObservation")
+        .unwrap();
+    let mut missing = payload.clone();
+    missing.as_object_mut().unwrap().remove("resolution");
+    assert!(
+        serde_json::from_value::<crate::storage::Command>(
+            serde_json::json!({"EnqueueResolvedObservation":missing})
+        )
+        .is_err()
+    );
+    let downgraded = serde_json::from_value::<crate::storage::Command>(
+        serde_json::json!({"EnqueueObservedWriter":payload}),
+    )
+    .unwrap();
+    let stats = journal.stats().unwrap();
+    assert!(matches!(
+        crate::storage::execute(&journal, downgraded),
+        Err(Error::Busy)
+    ));
+    assert_eq!(journal.stats().unwrap(), stats);
+}

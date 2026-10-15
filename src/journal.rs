@@ -45,11 +45,16 @@ pub(crate) struct EditTarget {
     pub committed: Option<Vec<u8>>,
     pub writer: WriterSnapshot,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ResolutionGuard {
     pub cursor: u64,
     pub local_revision: u64,
     pub lifecycle: nddev_device_sync_domain::sync::history::Lifecycle,
+}
+pub(crate) struct ObservationEnqueueGuard<'a> {
+    pub selected: &'a nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+    pub selected_operation: &'a [u8],
+    pub resolution: Option<&'a ResolutionGuard>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct ObservationResolution {

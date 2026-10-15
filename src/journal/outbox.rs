@@ -69,7 +69,36 @@ impl Journal {
             None,
             expected_revision,
             expected_pending,
-            Some((selected, selected_operation)),
+            Some(ObservationEnqueueGuard {
+                selected,
+                selected_operation,
+                resolution: None,
+            }),
+            Some(writer),
+        )
+    }
+    pub(crate) fn enqueue_observation_resolution(
+        &self,
+        body: Vec<u8>,
+        expected_revision: u64,
+        expected_pending: Option<String>,
+        source: (
+            &nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+            &[u8],
+        ),
+        writer: &WriterEnqueueGuard,
+        resolution: &ResolutionGuard,
+    ) -> Result<Enqueued, Error> {
+        self.enqueue_checked(
+            body,
+            Some(resolution.cursor),
+            expected_revision,
+            expected_pending,
+            Some(ObservationEnqueueGuard {
+                selected: source.0,
+                selected_operation: source.1,
+                resolution: Some(resolution),
+            }),
             Some(writer),
         )
     }
@@ -96,10 +125,7 @@ impl Journal {
         expected_cursor: Option<u64>,
         expected_revision: u64,
         expected_pending: Option<String>,
-        selected: Option<(
-            &nddev_device_sync_domain::repositories::catalog::CredentialSelection,
-            &[u8],
-        )>,
+        selected: Option<ObservationEnqueueGuard<'_>>,
         writer: Option<&WriterEnqueueGuard>,
     ) -> Result<Enqueued, Error> {
         if body.len() > 24576 {
@@ -113,13 +139,32 @@ impl Journal {
         if let Some(writer) = writer {
             writer::guard_enqueue(&tx, writer, &versioned)?;
         }
-        if let Some((selected, selected_operation)) = selected {
+        if let Some(observation) = &selected {
             if kind != "repository_state" {
                 return Err(Error::Invalid);
             }
-            let source = reads::selected_current(&tx, selected)?;
-            if source.body != selected_operation {
+            let source = reads::selected_current(&tx, observation.selected)?;
+            if source.body != observation.selected_operation {
                 return Err(Error::SelectionChanged);
+            }
+            if let Some(resolution) = observation.resolution {
+                if expected_cursor != Some(resolution.cursor)
+                    || resolution.lifecycle.resolved_through_seq > resolution.cursor
+                    || writer.is_none_or(|writer| {
+                        writer.expected_local_revision != Some(resolution.local_revision)
+                    })
+                    || !matches!(
+                        versioned.version,
+                        nddev_device_sync_domain::sync::history::OperationVersion::V3 { .. }
+                    )
+                    || versioned.lifecycle() != resolution.lifecycle
+                {
+                    return Err(Error::Invalid);
+                }
+                let (_, _, current) = reads::resolution_evidence(&tx, kind, &operation.entity_id)?;
+                if current != *resolution {
+                    return Err(Error::Busy);
+                }
             }
         }
         let entity = reads::entity(&tx, kind, &operation.entity_id)?;
@@ -134,7 +179,11 @@ impl Journal {
         }
         let revision = entity.as_ref().map_or(0, |e| e.revision);
         let pending = entity.as_ref().and_then(|e| e.pending_id.clone());
-        let base = entity.as_ref().map_or(0, |e| e.next_base);
+        let base = if expected_cursor.is_some() {
+            revision
+        } else {
+            entity.as_ref().map_or(0, |e| e.next_base)
+        };
         if revision != expected_revision
             || pending != expected_pending
             || operation.base_revision != base
@@ -148,7 +197,11 @@ impl Journal {
                 })
                 .map_err(sql_failed)?;
             if actual != expected
-                || kind != "vault_record"
+                || !(kind == "vault_record"
+                    || kind == "repository_state"
+                        && selected
+                            .as_ref()
+                            .is_some_and(|guard| guard.resolution.is_some()))
                 || !entity.as_ref().is_some_and(|e| e.conflicted)
             {
                 return Err(Error::Busy);
