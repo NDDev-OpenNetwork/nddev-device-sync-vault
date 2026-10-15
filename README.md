@@ -37,6 +37,23 @@ Unauthorized selections deny use. Rust
 callers recheck around external awaits together with the Accounts local-use
 fence and their cancellation lifetime; no secret or durable guard enters FFI.
 
+The Rust catalog caller captures repository baselines before provider I/O with
+its original Accounts fence, selected record and cancellation token. Publication
+reuses Core's semantic comparison and the ordinary encrypted writer. Source
+selection, ciphertext, writer facts and target revision are checked together in
+the enqueue transaction. Core's 32-operation catalog window is enforced there;
+unchanged facts produce no write, and stale/conflicted targets require a fresh
+provider read. This API does not itself run a catalog scan, resolve conflicts or
+synchronize Git repositories. A dispatched transaction retains its completion
+owner after its caller stops waiting.
+
+Saved catalog reads use local authorization and the retained Vault key without
+calling GitHub or resolving a GitHub credential. Each bounded repository page
+joins only its referenced owner observations under the existing local revision;
+a concurrent mutation returns Busy for a fresh read. Missing owner records stay
+absent. The opaque continuation is replica-scoped; every page reports its own
+observed cursor/revision and original timestamps, not current provider freshness.
+
 Run `just check`. The ignored native acceptance requires an explicitly started isolated PostgreSQL/Mailpit fixture and unlocked native credential service; set `NDS_FIXTURE_RECEIPT` and run `just native-acceptance`. Host checks do not prove another platform's secure-store or UI behavior.
 
 Vault record lists use 50-entity keyset pages with explicit continuation, including
@@ -98,3 +115,21 @@ requests that preference at startup and reports the observed result; it never
 claims protection from explicit site-data removal. Admission allows at most
 four concurrent storage calls, with a 500 ms wait for the connection; local
 acknowledgement is a completed storage transaction, not a cloud acknowledgement.
+
+The owning Cargo root selects the canonical Core Git source for both direct and
+transitive legacy Core URLs. Cargo ignores patches declared by dependencies:
+consuming application roots must select the same source and verify one Core
+package graph until their immutable transitive manifests have been adopted.
+
+Repository conflict capture retains the actual committed observation, latest
+conflict original/receipt and any undispatched local intent after reopen. All
+scoped receipts contribute to the existing resolution lifecycle; cursor values
+are not substituted for witnesses. Dispatched families are refused until their
+real outcome is known. Captured evidence does not itself resolve or delete a
+conflict. `resolve_repository_observation` confirms fresh provider input through
+Core, then queues a new operation against the observed committed revision. Its
+separate storage command rechecks source, writer, cursor/local revision and all
+scoped lifecycle witnesses together. The old conflict survives queueing/reopen
+and another Conflict receipt; only the actual Applied receipt retires it.
+Blocked-only intents have no server conflict receipt and still need their own
+explicit transition. The automatic catalog caller has not yet adopted resolution.

@@ -7,6 +7,7 @@ use nddev_device_sync_domain::{
 mod checkpoint;
 mod fence;
 mod io;
+mod observations;
 mod receipts;
 struct Owned(std::path::PathBuf);
 impl Drop for Owned {

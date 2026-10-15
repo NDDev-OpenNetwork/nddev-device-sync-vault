@@ -45,19 +45,34 @@ pub(crate) struct EditTarget {
     pub committed: Option<Vec<u8>>,
     pub writer: WriterSnapshot,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ResolutionGuard {
     pub cursor: u64,
     pub local_revision: u64,
     pub lifecycle: nddev_device_sync_domain::sync::history::Lifecycle,
 }
+pub(crate) struct ObservationEnqueueGuard<'a> {
+    pub selected: &'a nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+    pub selected_operation: &'a [u8],
+    pub resolution: Option<&'a ResolutionGuard>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ObservationResolution {
+    pub target: Entity,
+    pub conflict: Option<RawRow>,
+    pub pending: Option<Vec<u8>>,
+    pub guard: ResolutionGuard,
+}
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ObservationTarget {
     pub effective: Option<Entity>,
-    // Exact committed operation bytes: main Rust decodes its eventual outer
-    // lifecycle/header. Never infer it from a pending payload or from cursor.
-    pub committed_operation: Option<Vec<u8>>,
     pub cursor: u64,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct CatalogRows {
+    pub entries: Vec<(String, Entity)>,
+    pub cursor: u64,
+    pub local_revision: u64,
 }
 // Mechanical IPC metadata projection for NdsClient::CatalogPort.
 // No payload, keys or domain decisions are carried by this read.
@@ -75,8 +90,7 @@ pub struct ObservationBaselines {
     // same-transaction source-body expectation. No credential bytes.
     pub selected_operation: Vec<u8>,
     pub targets: Vec<ObservationMetadata>,
-    pub cursor: u64,
-    pub local_revision: u64,
+    pub(crate) writer: WriterSnapshot,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Pending {
