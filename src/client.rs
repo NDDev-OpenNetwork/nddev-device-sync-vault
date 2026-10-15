@@ -4,9 +4,10 @@ use crate::{
     storage::Storage,
 };
 use nddev_device_sync_accounts::{IdentityClient, SyncRequest, sync_wire as wire};
-use nddev_device_sync_application::replica::{self, ReplicaPort, VerifiedPage};
+use nddev_device_sync_application::replica::{self};
 use nddev_device_sync_domain::repositories::catalog::CredentialSelection;
-use nddev_device_sync_domain::vault::Record;
+use nddev_device_sync_domain::sync::history::OperationVersion;
+use nddev_device_sync_domain::vault::{Record, Record3};
 use nddev_device_sync_domain::{
     DeviceId,
     sync::{EncryptedPayload, EntityKind, MAX_PLAIN_BYTES, Operation},
@@ -25,8 +26,32 @@ use nddev_device_sync_domain::state::{Reachability, Snapshot, State};
 
 struct Expected {
     revision: u64,
-    cursor: Option<u64>,
+    resolution: Option<crate::journal::ResolutionGuard>,
     pending: Option<String>,
+}
+enum ReadRecord {
+    Legacy(Record),
+    Current(Record3),
+}
+impl ReadRecord {
+    fn deleted(&self) -> bool {
+        match self {
+            Self::Legacy(r) => r.deleted,
+            Self::Current(r) => r.deleted,
+        }
+    }
+    fn display(&self) -> (String, String) {
+        match self {
+            Self::Legacy(r) => (r.title.clone(), r.username.clone()),
+            Self::Current(r) => (r.title.clone(), r.username.clone()),
+        }
+    }
+    fn secret(self) -> Zeroizing<String> {
+        match self {
+            Self::Legacy(r) => r.secret,
+            Self::Current(r) => r.secret,
+        }
+    }
 }
 /// Rust runtime progress, separate from global freshness and upload eligibility.
 pub struct InboxProgress {
@@ -41,6 +66,7 @@ pub struct VaultClient {
     sync_gate: Arc<Semaphore>,
     view: Mutex<VaultView>,
     expected_key: Mutex<Option<String>>,
+    known_committed_seq: std::sync::atomic::AtomicU64,
 }
 fn dependency<E>(_: E) -> Error {
     Error::Unavailable
@@ -71,6 +97,7 @@ impl VaultClient {
             sync_gate: Arc::new(Semaphore::new(1)),
             view: Mutex::default(),
             expected_key: Mutex::default(),
+            known_committed_seq: std::sync::atomic::AtomicU64::new(0),
         };
         client.update_view().await?;
         #[cfg(target_arch = "wasm32")]
@@ -136,6 +163,18 @@ impl VaultClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let expected = if expected.is_some() {
+            expected
+        } else {
+            match self
+                .journal
+                .call(crate::storage::Command::WriterSnapshot)
+                .await?
+            {
+                crate::storage::Reply::WriterSnapshot(s) => s.facts.key_id,
+                _ => return Err(Error::Invalid),
+            }
+        };
         Ok(match expected {
             Some(expected) => keys.into_iter().find(|key| key.id() == expected),
             None => keys.into_iter().next(),
@@ -177,7 +216,7 @@ impl VaultClient {
         let _permit = self.admitted()?;
         self.update_view().await
     }
-    async fn ensure_key(&self) -> Result<(), Error> {
+    async fn prepare_identity(&self) -> Result<(), Error> {
         if !self.identity.view().session_verified {
             let view = self.identity.refresh().await.map_err(identity_failure)?;
             if !view.authenticated {
@@ -189,68 +228,6 @@ impl VaultClient {
             self.identity.refresh_devices().await.map_err(dependency)?;
             self.authorized()?;
         }
-        self.discover_key().await?;
-        let lock = self.journal.key_lock().await?;
-        let existing = self.key().await?;
-        let material = existing
-            .as_ref()
-            .map(|key| {
-                nddev_device_sync_domain::vault::KeyMaterial::new(key.native_secret().as_slice())
-                    .map_err(|_| Error::Authentication)
-            })
-            .transpose()?;
-        let delivered = self
-            .identity
-            .ensure_vault_key(material.as_ref())
-            .await
-            .map_err(|error| match error {
-                nddev_device_sync_accounts::ClientError::Server(code)
-                    if code == "vault_key_registration_required" =>
-                {
-                    Error::RegistrationRequired
-                }
-                nddev_device_sync_accounts::ClientError::Server(code)
-                    if code == "operation_conflict" =>
-                {
-                    Error::Authentication
-                }
-                nddev_device_sync_accounts::ClientError::DeviceRevoked
-                | nddev_device_sync_accounts::ClientError::RevalidationRequired => Error::Locked,
-                _ => Error::Unavailable,
-            })?;
-        let expected = self
-            .expected_key
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if expected.is_some_and(|id| id != delivered.id()) {
-            return Err(Error::Authentication);
-        }
-        let key = VaultKey::from_native_secret(delivered.expose())?;
-        self.retain_key(&key).await?;
-        *self.expected_key.lock().unwrap_or_else(|e| e.into_inner()) = Some(key.id());
-        drop(lock);
-        Ok(())
-    }
-    async fn discover_key(&self) -> Result<(), Error> {
-        let reply = self
-            .identity
-            .sync_request(SyncRequest::Page { after: 0, limit: 1 })
-            .await
-            .map_err(identity_failure)?;
-        let page: wire::SyncPage =
-            serde_json::from_slice(&reply.body).map_err(|_| Error::Invalid)?;
-        let expected = if let Some(entry) = page.entries.first() {
-            let body = serde_json::to_vec(&entry.operation).map_err(dependency)?;
-            codec::operation(&entry.operation, body.len())?;
-            Some(entry.operation.payload.key_id.clone())
-        } else {
-            if page.next_after_seq != 0 || page.has_more {
-                return Err(Error::Invalid);
-            }
-            None
-        };
-        *self.expected_key.lock().unwrap_or_else(|e| e.into_inner()) = expected;
         Ok(())
     }
     async fn retain_key(&self, key: &VaultKey) -> Result<(), Error> {
@@ -298,9 +275,27 @@ impl VaultClient {
         if plaintext.len() > MAX_PLAIN_BYTES {
             return Err(Error::Invalid);
         }
+        let fence = self
+            .identity
+            .local_use_fence()
+            .await
+            .map_err(identity_failure)?;
         let key = self.key().await?.ok_or(Error::Locked)?;
-        let entity_id = id.clone();
-        let existing = self.journal.entity(kind.as_str(), &entity_id).await?;
+        let capture = match self
+            .journal
+            .call(crate::storage::Command::EditTarget {
+                kind: kind.as_str().into(),
+                id: id.clone(),
+                known: self
+                    .known_committed_seq
+                    .load(std::sync::atomic::Ordering::Acquire),
+            })
+            .await?
+        {
+            crate::storage::Reply::EditTarget(c) => c,
+            _ => return Err(Error::Invalid),
+        };
+        let existing = capture.entity;
         let revision = existing.as_ref().map_or(0, |entity| entity.revision);
         let pending = existing
             .as_ref()
@@ -312,9 +307,19 @@ impl VaultClient {
         {
             return Err(Error::Busy);
         }
-        let expected_cursor = expected.as_ref().and_then(|expected| expected.cursor);
+        let resolution = expected
+            .as_ref()
+            .and_then(|expected| expected.resolution.as_ref());
+        if resolution.is_some_and(|guard| {
+            guard.cursor != capture.writer.cursor
+                || guard.local_revision != capture.writer.local_revision
+                || guard.lifecycle.resolved_through_seq > guard.cursor
+        }) {
+            return Err(Error::Busy);
+        }
+        let expected_cursor = resolution.map(|guard| guard.cursor);
         let operation_id = uuid::Uuid::new_v4().to_string();
-        let mut operation = Operation {
+        let operation = Operation {
             id: operation_id.clone(),
             device: DeviceId::new(&self.scope.device).map_err(dependency)?,
             entity_kind: kind,
@@ -327,12 +332,88 @@ impl VaultClient {
                 ciphertext: vec![],
             },
         };
-        operation.payload = key.encrypt(&self.scope, &operation, plaintext)?;
-        let bytes = codec::body(&operation)?;
-        let receipt = self
+        let mut lifecycle = capture
+            .committed
+            .as_ref()
+            .map(|body| codec::versioned(body).map(|o| o.lifecycle()))
+            .transpose()?
+            .unwrap_or(nddev_device_sync_domain::sync::history::Lifecycle {
+                resolved_through_seq: 0,
+            });
+        let facts = history_replica::facts(&capture.writer)?;
+        if let Some(guard) = resolution
+            && facts
+                .confirmed
+                .as_ref()
+                .is_some_and(|f| f.mode == replica::WriterMode::V3)
+        {
+            lifecycle = guard.lifecycle;
+        }
+        let mut prepared = replica::prepare_offline_operation(
+            operation,
+            lifecycle,
+            &facts,
+            replica::LocalWriterContext {
+                authorized: true,
+                actual_key: &key.id(),
+                cursor: capture.writer.cursor,
+                known_committed: capture.writer.known_committed_seq.max(
+                    self.known_committed_seq
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ),
+            },
+        )?;
+        prepared = Self::inherit_legacy_resolution(
+            &self.scope,
+            &key,
+            prepared,
+            capture.committed.as_deref(),
+            revision,
+            existing.as_ref().map_or(0, |entity| entity.server_seq),
+        )?;
+        let current_plain = if kind == EntityKind::VaultRecord {
+            Some(Self::record_plaintext(
+                &self.scope,
+                &key,
+                &prepared,
+                plaintext,
+                capture.committed.as_deref(),
+            )?)
+        } else {
+            None
+        };
+        let plain = current_plain
+            .as_deref()
+            .map_or(plaintext, |bytes| bytes.as_slice());
+        prepared.operation.payload = key.encrypt_versioned(&self.scope, &prepared, plain)?;
+        let bytes = codec::versioned_body(&prepared)?;
+        let basis_seq = match prepared.version {
+            OperationVersion::V2 => None,
+            OperationVersion::V3 { basis_seq, .. } => Some(basis_seq),
+        };
+        self.identity
+            .validate_local_use(&fence)
+            .await
+            .map_err(identity_failure)?;
+        let receipt = match self
             .journal
-            .enqueue(bytes, expected_cursor, revision, pending)
-            .await?;
+            .call(crate::storage::Command::EnqueueWriter {
+                body: bytes,
+                expected_cursor,
+                expected_revision: revision,
+                expected_pending: pending,
+                writer: crate::journal::WriterEnqueueGuard {
+                    facts: capture.writer.facts,
+                    actual_key_id: key.id(),
+                    basis_seq,
+                    expected_local_revision: resolution.map(|guard| guard.local_revision),
+                },
+            })
+            .await?
+        {
+            crate::storage::Reply::Enqueued(r) => r,
+            _ => return Err(Error::Invalid),
+        };
         // The transaction has committed. No subsequent native-store/SQLite read
         // may turn this durable success into an apparent failed mutation.
         let mut view = self.view.lock().unwrap_or_else(|error| error.into_inner());
@@ -354,11 +435,9 @@ impl VaultClient {
         let id = format!("{}:clipboard", self.scope.device);
         let plaintext = Zeroizing::new(serde_json::to_vec(&payload).map_err(dependency)?);
         if let Some(previous) = self.journal.entity("clipboard_item", &id).await? {
-            let wire: wire::SyncOperation =
-                serde_json::from_slice(&previous.body).map_err(dependency)?;
-            let operation = codec::operation(&wire, previous.body.len())?;
+            let operation = codec::versioned(&previous.body)?;
             let key = self.key().await?.ok_or(Error::Locked)?;
-            if key.decrypt(&self.scope, &operation)?.as_slice() == plaintext.as_slice() {
+            if key.decrypt_versioned(&self.scope, &operation)?.as_slice() == plaintext.as_slice() {
                 return Ok(id);
             }
         }
@@ -383,9 +462,9 @@ impl VaultClient {
         let Some((id, entity)) = self.journal.latest_clipboard().await? else {
             return Ok(None);
         };
-        let wire: wire::SyncOperation = serde_json::from_slice(&entity.body).map_err(dependency)?;
-        let operation = codec::operation(&wire, entity.body.len())?;
-        let plaintext = key.decrypt(&self.scope, &operation)?;
+        let envelope = codec::versioned(&entity.body)?;
+        let operation = &envelope.operation;
+        let plaintext = key.decrypt_versioned(&self.scope, &envelope)?;
         let value: nddev_device_sync_domain::clipboard::Text =
             serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
         value.validate().map_err(|_| Error::Invalid)?;
@@ -438,11 +517,84 @@ impl VaultClient {
             plaintext.as_slice(),
             Some(Expected {
                 revision: expected_revision,
-                cursor: None,
+                resolution: None,
                 pending: expected_pending,
             }),
         )
         .await
+    }
+    pub(crate) fn inherit_legacy_resolution(
+        scope: &Scope,
+        key: &VaultKey,
+        next: nddev_device_sync_domain::sync::history::VersionedOperation,
+        committed: Option<&[u8]>,
+        revision: u64,
+        sequence: u64,
+    ) -> Result<nddev_device_sync_domain::sync::history::VersionedOperation, Error> {
+        if next.version == OperationVersion::V2
+            || next.operation.entity_kind != EntityKind::VaultRecord
+        {
+            return Ok(next);
+        }
+        let Some(body) = committed else {
+            return Ok(next);
+        };
+        let prior = codec::versioned(body)?;
+        if prior.version != OperationVersion::V2 {
+            return Ok(next);
+        }
+        let plaintext = key.decrypt_versioned(scope, &prior)?;
+        let record: Record = serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
+        record.validate().map_err(|_| Error::Invalid)?;
+        if record.resolved_through_seq == 0 {
+            return Ok(next);
+        }
+        let applied = nddev_device_sync_domain::sync::history::AppliedHeadMeta::verified_v2(
+            &prior,
+            body.len(),
+            revision,
+            sequence,
+        )?;
+        Ok(applied.inherit_legacy_resolution(record.resolved_through_seq, next)?)
+    }
+    pub(crate) fn record_plaintext(
+        scope: &Scope,
+        key: &VaultKey,
+        operation: &nddev_device_sync_domain::sync::history::VersionedOperation,
+        plaintext: &[u8],
+        committed: Option<&[u8]>,
+    ) -> Result<Zeroizing<Vec<u8>>, Error> {
+        let mut legacy: Record = serde_json::from_slice(plaintext).map_err(|_| Error::Invalid)?;
+        legacy.validate().map_err(|_| Error::Invalid)?;
+        if operation.version == OperationVersion::V2 {
+            if let Some(body) = committed {
+                let prior = codec::versioned(body)?;
+                if prior.version != OperationVersion::V2
+                    || prior.operation.entity_kind != operation.operation.entity_kind
+                    || prior.operation.entity_id != operation.operation.entity_id
+                {
+                    return Err(Error::Invalid);
+                }
+                let plaintext = key.decrypt_versioned(scope, &prior)?;
+                let prior: Record =
+                    serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
+                legacy = legacy.inherit_resolution(&prior)?;
+            }
+            return Ok(Zeroizing::new(
+                serde_json::to_vec(&legacy).map_err(dependency)?,
+            ));
+        }
+        let current = Record3 {
+            version: 3,
+            deleted: legacy.deleted,
+            title: legacy.title,
+            username: legacy.username,
+            secret: legacy.secret,
+        };
+        current.validate().map_err(|_| Error::Invalid)?;
+        Ok(Zeroizing::new(
+            serde_json::to_vec(&current).map_err(dependency)?,
+        ))
     }
     pub async fn records(&self, after: String) -> Result<RecordPage, Error> {
         let _permit = self.admitted()?;
@@ -464,27 +616,28 @@ impl VaultClient {
                 entity,
                 conflict,
             } = entry;
-            let record = self.decode_record(&key, &entity.body)?;
+            let record = self.read_record(&key, &entity.body)?;
             let conflict = conflict
                 .map(|body| {
-                    let wire: wire::SyncOperation =
-                        serde_json::from_slice(&body).map_err(|_| Error::Invalid)?;
-                    let record = self.decode_record(&key, &body)?;
+                    let operation = codec::versioned(&body)?;
+                    let record = self.read_record(&key, &body)?;
+                    let (title, username) = record.display();
                     Ok::<_, Error>(crate::view::ConflictView {
-                        title: record.title,
-                        username: record.username,
-                        device_id: wire.device_id,
-                        deleted: record.deleted,
+                        title,
+                        username,
+                        device_id: operation.operation.device.as_str().into(),
+                        deleted: record.deleted(),
                     })
                 })
                 .transpose()?;
-            if !record.deleted || entity.conflicted {
+            if !record.deleted() || entity.conflicted {
+                let (title, username) = record.display();
                 items.push(RecordView {
-                    deleted: record.deleted,
+                    deleted: record.deleted(),
                     observed_seq,
                     id,
-                    title: record.title,
-                    username: record.username,
+                    title,
+                    username,
                     revision: entity.revision,
                     pending_id: entity.pending_id,
                     conflicted: entity.conflicted,
@@ -501,16 +654,44 @@ impl VaultClient {
         })
     }
     fn decode_record(&self, key: &VaultKey, body: &[u8]) -> Result<Record, Error> {
-        let wire = serde_json::from_slice(body).map_err(|_| Error::Invalid)?;
-        let operation = codec::operation(&wire, body.len())?;
-        let plaintext = key.decrypt(&self.scope, &operation)?;
-        let record: Record = serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
-        record.validate().map_err(|_| Error::Invalid)?;
-        Ok(record)
+        // Fields for a new explicit action only; retained ciphertext/header are
+        // never relabelled, and legacy inner R is not a V3 resolution witness.
+        match self.read_record(key, body)? {
+            ReadRecord::Legacy(r) => Ok(r),
+            ReadRecord::Current(r) => Ok(Record {
+                version: 1,
+                deleted: r.deleted,
+                title: r.title,
+                username: r.username,
+                secret: r.secret,
+                resolved_through_seq: 0,
+            }),
+        }
+    }
+    fn read_record(&self, key: &VaultKey, body: &[u8]) -> Result<ReadRecord, Error> {
+        let operation = codec::versioned(body)?;
+        if operation.operation.entity_kind != EntityKind::VaultRecord {
+            return Err(Error::Invalid);
+        }
+        let plaintext = key.decrypt_versioned(&self.scope, &operation)?;
+        match operation.version {
+            OperationVersion::V2 => {
+                let record: Record =
+                    serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
+                record.validate().map_err(|_| Error::Invalid)?;
+                Ok(ReadRecord::Legacy(record))
+            }
+            OperationVersion::V3 { .. } => {
+                let record: Record3 =
+                    serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
+                record.validate().map_err(|_| Error::Invalid)?;
+                Ok(ReadRecord::Current(record))
+            }
+        }
     }
     /// Publish an explicit decision at the observed revision. A competing server
-    /// commit creates another conflict; local conflicts clear only on an applied
-    /// encrypted version 2 record, and every replica observes the same decision.
+    /// commit creates another conflict. Only an Applied decision clears the
+    /// observed alternatives; its original format owns the resolution metadata.
     pub async fn resolve_record(
         &self,
         id: String,
@@ -525,10 +706,10 @@ impl VaultClient {
             return Err(Error::Busy);
         }
         let lookup = id.clone();
-        let (entity, conflict, cursor) = self.journal.resolution(lookup).await?;
+        let (entity, conflict, resolution) = self.journal.resolution(lookup).await?;
         if !entity.conflicted
             || entity.revision != expected_revision
-            || cursor != expected_cursor
+            || resolution.cursor != expected_cursor
             || entity.pending_id != expected_pending
         {
             return Err(Error::Busy);
@@ -541,7 +722,7 @@ impl VaultClient {
         };
         let mut record = self.decode_record(&key, &body)?;
         record.version = 2;
-        record.resolved_through_seq = cursor;
+        record.resolved_through_seq = expected_cursor;
         record.validate().map_err(|_| Error::Invalid)?;
         let bytes = Zeroizing::new(serde_json::to_vec(&record).map_err(dependency)?);
         self.put_inner(
@@ -550,7 +731,7 @@ impl VaultClient {
             &bytes,
             Some(Expected {
                 revision: expected_revision,
-                cursor: Some(expected_cursor),
+                resolution: Some(resolution),
                 pending: expected_pending,
             }),
         )
@@ -588,7 +769,7 @@ impl VaultClient {
             &bytes,
             Some(Expected {
                 revision: expected_revision,
-                cursor: None,
+                resolution: None,
                 pending: expected_pending,
             }),
         )
@@ -628,9 +809,7 @@ impl VaultClient {
     /// Native use only. The presentation wrapper delegates to native clipboard
     /// or declared provider adapters; it never returns this value through FFI.
     pub async fn native_secret(&self, id: String) -> Result<Zeroizing<String>, Error> {
-        self.usable_record(&id, None)
-            .await
-            .map(|record| record.secret)
+        self.usable_record(&id, None).await.map(ReadRecord::secret)
     }
     /// Resolve exactly the selected local version for an explicit Rust caller.
     /// Revision alone cannot identify a replacement unsent edit. Secret bytes
@@ -641,7 +820,7 @@ impl VaultClient {
     ) -> Result<Zeroizing<String>, Error> {
         self.usable_record(selection.record_ref(), Some(selection))
             .await
-            .map(|record| record.secret)
+            .map(ReadRecord::secret)
     }
     /// Point-in-time recheck around an external await. It neither retains a
     /// lock across the request nor makes an already sent request revocable.
@@ -657,7 +836,7 @@ impl VaultClient {
         &self,
         id: &str,
         selection: Option<&CredentialSelection>,
-    ) -> Result<Record, Error> {
+    ) -> Result<ReadRecord, Error> {
         nddev_device_sync_domain::ModuleId::new(id).map_err(|_| Error::Invalid)?;
         let _permit = self.admitted()?;
         let key = self.key().await?.ok_or(Error::Locked)?;
@@ -683,8 +862,8 @@ impl VaultClient {
                 Error::Busy
             });
         }
-        let record = self.decode_record(&key, &entity.body)?;
-        if record.deleted {
+        let record = self.read_record(&key, &entity.body)?;
+        if record.deleted() {
             return Err(missing_or_deleted);
         }
         self.identity
@@ -718,7 +897,7 @@ impl VaultClient {
             .unwrap_or_else(|e| e.into_inner())
             .catching_up = true;
         let result = nddev_device_sync_accounts::runtime::timeout(replica::BATCH_DEADLINE, async {
-            self.ensure_key().await?;
+            self.prepare_identity().await?;
             self.reconcile_inner(inbox_only).await
         })
         .await
@@ -735,7 +914,10 @@ impl VaultClient {
     // A blocked publication must remain visible after its background task stops.
     fn finish_sync(&self, result: Result<VaultView, Error>) -> Result<VaultView, Error> {
         let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
-        view.sync_error = result.as_ref().err().map(Error::code).unwrap_or_default();
+        view.sync_error = match &result {
+            Err(error) => error.code(),
+            Ok(completed) => completed.sync_error.clone(),
+        };
         if matches!(result, Err(Error::Locked | Error::RegistrationRequired)) {
             view.unlocked = false;
         }
@@ -754,14 +936,15 @@ impl VaultClient {
             if snapshots.is_empty() || snapshots.len() > 32 {
                 return Err(Error::Invalid);
             }
-            self.ensure_key().await?;
-            let key = self.key().await?.ok_or(Error::Locked)?;
+            self.prepare_identity().await?;
             self.synchronize_inner().await?;
+            let key = self.key().await?.ok_or(Error::Locked)?;
             let writer = DeviceId::new(self.scope.device.clone()).map_err(dependency)?;
             let mut targets = std::collections::BTreeSet::new();
             let mut prepared = Vec::new();
             for snapshot in snapshots {
                 let (kind, id) = match &snapshot.data {
+                    State::Repository { .. } => return Err(Error::Invalid),
                     State::Device { .. } => (EntityKind::DeviceState, self.scope.device.clone()),
                     State::Module { module_id, .. } => (
                         EntityKind::ModuleState,
@@ -781,10 +964,8 @@ impl VaultClient {
                 let lookup_id = id.clone();
                 let previous = self.journal.entity(kind.as_str(), &lookup_id).await?;
                 if let Some(previous) = previous {
-                    let wire: wire::SyncOperation =
-                        serde_json::from_slice(&previous.body).map_err(dependency)?;
-                    let operation = codec::operation(&wire, previous.body.len())?;
-                    let bytes = key.decrypt(&self.scope, &operation)?;
+                    let envelope = codec::versioned(&previous.body)?;
+                    let bytes = key.decrypt_versioned(&self.scope, &envelope)?;
                     if let Ok(previous) = serde_json::from_slice::<Snapshot>(&bytes)
                         && previous.data == snapshot.data
                     {
@@ -830,10 +1011,9 @@ impl VaultClient {
             .unwrap_or(after);
         let mut items = Vec::new();
         for (kind, id, entity) in entries {
-            let wire: wire::SyncOperation =
-                serde_json::from_slice(&entity.body).map_err(dependency)?;
-            let operation = codec::operation(&wire, entity.body.len())?;
-            let plaintext = key.decrypt(&self.scope, &operation)?;
+            let envelope = codec::versioned(&entity.body)?;
+            let operation = &envelope.operation;
+            let plaintext = key.decrypt_versioned(&self.scope, &envelope)?;
             let snapshot: Snapshot = match serde_json::from_slice(&plaintext) {
                 Ok(value) => value,
                 Err(_) => {
@@ -878,6 +1058,7 @@ impl VaultClient {
                 conflicted: entity.conflicted,
             };
             match snapshot.data {
+                State::Repository { .. } => return Err(Error::Invalid),
                 State::Device {
                     display_name,
                     platform,
@@ -936,8 +1117,7 @@ impl VaultClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .catching_up = true;
-        let key = self.key().await?.ok_or(Error::Locked)?;
-        let port = Replica { client: self, key };
+        let port = history_replica::Replica::new(self).await?;
         let progress = if inbox_only {
             replica::reconcile_inbox(&port).await?
         } else {
@@ -947,18 +1127,31 @@ impl VaultClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .catching_up = !progress.caught_up;
+        self.update_view().await?;
+        let reason = match self
+            .journal
+            .call(crate::storage::Command::UnknownReason)
+            .await?
+        {
+            crate::storage::Reply::UnknownReason(r) => r,
+            _ => return Err(Error::Invalid),
+        };
+        let mut view = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        view.sync_error = match reason.as_deref() {
+            Some("basis_expired") => "sync_basis_expired",
+            Some("legacy_missing") => "sync_legacy_outcome_unknown",
+            None => "",
+            _ => return Err(Error::Invalid),
+        }
+        .into();
         Ok(InboxProgress {
-            view: self.update_view().await?,
+            view: view.clone(),
             inbox_at_head: progress.inbox_at_head,
         })
     }
 }
 
 // Concrete wire/crypto/storage composition for the shared application use case.
-struct Replica<'a> {
-    client: &'a VaultClient,
-    key: VaultKey,
-}
 impl From<nddev_device_sync_domain::sync::SyncError> for Error {
     fn from(error: nddev_device_sync_domain::sync::SyncError) -> Self {
         use nddev_device_sync_domain::sync::SyncError;
@@ -970,86 +1163,6 @@ impl From<nddev_device_sync_domain::sync::SyncError> for Error {
             SyncError::KeyRegistration => Self::RegistrationRequired,
             _ => Self::Invalid,
         }
-    }
-}
-impl ReplicaPort for Replica<'_> {
-    type Error = Error;
-    type Pending = crate::journal::Pending;
-    type Receipt = (Vec<u8>, u64);
-    type Page = (wire::SyncPage, Vec<u64>);
-
-    async fn claim(&self) -> Result<Vec<Self::Pending>, Error> {
-        self.client.journal.pending().await
-    }
-    async fn append(&self, pending: &Self::Pending) -> Result<Self::Receipt, Error> {
-        let operation = serde_json::from_slice(&pending.body).map_err(|_| Error::Invalid)?;
-        let resolved = self.client.verify_operation(&self.key, &operation)?;
-        let result = self
-            .client
-            .identity
-            .sync_request(SyncRequest::Append(pending.body.clone()))
-            .await
-            .map_err(identity_failure)?;
-        if !matches!(result.status, 201 | 409) {
-            return Err(Error::Invalid);
-        }
-        Ok((result.body, resolved))
-    }
-    async fn acknowledge(
-        &self,
-        pending: Self::Pending,
-        receipt: Self::Receipt,
-    ) -> Result<(), Error> {
-        self.client
-            .journal
-            .acknowledge(pending.body, receipt.0, receipt.1)
-            .await
-    }
-    async fn cursor(&self) -> Result<u64, Error> {
-        self.client.journal.cursor().await
-    }
-    async fn verified_page(
-        &self,
-        after: u64,
-        limit: usize,
-    ) -> Result<VerifiedPage<Self::Page>, Error> {
-        let result = self
-            .client
-            .identity
-            .sync_request(SyncRequest::Page {
-                after,
-                limit: limit.try_into().map_err(|_| Error::Invalid)?,
-            })
-            .await
-            .map_err(identity_failure)?;
-        let page: wire::SyncPage =
-            serde_json::from_slice(&result.body).map_err(|_| Error::Invalid)?;
-        let resolutions = page
-            .entries
-            .iter()
-            .map(|entry| self.client.verify_operation(&self.key, &entry.operation))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(VerifiedPage {
-            next_after: page.next_after_seq.try_into().map_err(|_| Error::Invalid)?,
-            entries: page.entries.len(),
-            has_more: page.has_more,
-            contents: (page, resolutions),
-        })
-    }
-    async fn ingest(&self, (page, resolutions): Self::Page) -> Result<(), Error> {
-        self.client.journal.ingest(page, resolutions).await
-    }
-    async fn caught_up(&self, cursor: u64) -> Result<bool, Error> {
-        self.client
-            .journal
-            .caught_up(
-                cursor,
-                time::OffsetDateTime::now_utc()
-                    .unix_timestamp()
-                    .try_into()
-                    .map_err(|_| Error::Invalid)?,
-            )
-            .await
     }
 }
 
@@ -1639,3 +1752,10 @@ mod tests {
         outcome.unwrap();
     }
 }
+
+#[path = "checkpoint_client.rs"]
+mod checkpoint;
+pub use checkpoint::CheckpointStage;
+
+#[path = "history_replica.rs"]
+pub(crate) mod history_replica;

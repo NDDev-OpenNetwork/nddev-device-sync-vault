@@ -11,7 +11,7 @@ default = []
 development-http = ["nddev-device-sync-accounts/development-http"]
 
 [dependencies]
-nddev-device-sync-application = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "75250e0e7297c214e36d057987ef328ea5543a4b" }
+nddev-device-sync-application = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "19ceef8a233b68ace3b18ebeb852633ed26d208c" }
 base64 = "0.22"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
@@ -22,8 +22,8 @@ tracing = "0.1"
 nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "38f48cf88fb2222d2ccde22460a8f2f564f8e47b" }
 time = { version = "0.3", features = ["wasm-bindgen"] }
 uuid = { version = "1.27", features = ["v4"] }
-nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "75250e0e7297c214e36d057987ef328ea5543a4b" }
-nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts.git", rev = "dd5da10bb6aff46a111546508f1d9daebd6851c0" }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git", rev = "19ceef8a233b68ace3b18ebeb852633ed26d208c" }
+nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "aa387beaf08ba53ec630d6fb64b6861f7075486b" }
 
 tokio = { version = "1.53", features = ["rt", "sync", "time"] }
 sha2 = "0.10"
