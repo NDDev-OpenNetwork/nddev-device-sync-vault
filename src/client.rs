@@ -90,7 +90,10 @@ impl VaultClient {
         let encoded =
             serde_json::to_vec(&(&scope.origin, &scope.tenant, &scope.user, &scope.device))
                 .map_err(dependency)?;
-        let name = format!("{:x}.db", Sha256::digest(encoded));
+        let name = format!(
+            "{}.db",
+            base16ct::lower::encode_string(&Sha256::digest(encoded))
+        );
         let journal = Storage::open(data_dir.join("sync").join(name)).await?;
         let client = Self {
             identity,

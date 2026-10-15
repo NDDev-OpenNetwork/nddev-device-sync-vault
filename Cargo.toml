@@ -12,22 +12,23 @@ development-http = ["nddev-device-sync-accounts/development-http"]
 
 [dependencies]
 nddev-device-sync-application = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "889f0f4a9b6416e92eaaac111471a9d700ef8468" }
-base64 = "0.22"
+base64 = "0.23.1"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zeroize = { version = "1.8", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
-nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "38f48cf88fb2222d2ccde22460a8f2f564f8e47b" }
+nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "40f1f799a395f67e7a565e9c0c9f4b5ba7fdbe67" }
 time = { version = "0.3", features = ["wasm-bindgen"] }
 uuid = { version = "1.27", features = ["v4"] }
 nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "889f0f4a9b6416e92eaaac111471a9d700ef8468" }
-nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "aa387beaf08ba53ec630d6fb64b6861f7075486b" }
+nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "3f051572534329c1469562a7c1108b75ecfc77cc" }
 
 tokio = { version = "1.53", features = ["rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-sha2 = "0.10"
+sha2 = "0.11.1"
+base16ct = { version = "1.0", features = ["alloc"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -42,6 +43,8 @@ tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time"] }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["libsqlite3-sys", "bundled", "fallible_uint"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 rusqlite = { version="=0.40.2",default-features=false,features=["ffi-sqlite-wasm-rs","fallible_uint"] }
+# rusqlite 0.40.2 requires sqlite-wasm-rs 0.5; VFS 0.3 uses incompatible
+# rsqlite-vfs 0.2 callbacks. Upgrade this pair with a compatible rusqlite release.
 sqlite-wasm-rs = "=0.5.5"
 sqlite-wasm-vfs = "=0.2.0"
 wasm-bindgen = "=0.2.129"
@@ -49,9 +52,3 @@ wasm-bindgen-futures = "=0.4.79"
 js-sys = "=0.3.106"
 uuid = { version="1.27",features=["js"] }
 ring = { version="0.17",features=["wasm32_unknown_unknown_js"] }
-
-# ponytail (Core adoption): normalize immutable transitive legacy URLs to this
-# root's canonical Core source. Remove when all transitive manifests use it.
-[patch."https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git"]
-nddev-device-sync-application = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "889f0f4a9b6416e92eaaac111471a9d700ef8468" }
-nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "889f0f4a9b6416e92eaaac111471a9d700ef8468" }
