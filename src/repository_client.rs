@@ -4,8 +4,8 @@
 use super::*;
 use nddev_device_sync_accounts::LocalUseFence;
 use nddev_device_sync_domain::repositories::catalog::observations::{
-    Candidate, ObservationContext, ObservationKey, ObservedTarget, PublicationDecision,
-    RepositoryObservation, ResolutionDecision, ResolutionRead, TargetVersion,
+    Candidate, KnownConflict, ObservationContext, ObservationKey, ObservedTarget,
+    PublicationDecision, RepositoryObservation, ResolutionDecision, ResolutionRead, TargetVersion,
 };
 use nddev_device_sync_domain::sync::history::VersionedOperation;
 use std::collections::BTreeMap;
@@ -102,6 +102,7 @@ pub struct RepositoryResolution {
         nddev_device_sync_domain::sync::Receipt,
     )>,
     pending: Option<RetainedRepositoryObservation>,
+    pending_blocked: bool,
     guard: crate::journal::ResolutionGuard,
 }
 impl RepositoryResolution {
@@ -121,6 +122,35 @@ impl RepositoryResolution {
     /// Actual undispatched local intent; a server receipt is never fabricated.
     pub fn pending(&self) -> Option<&RetainedRepositoryObservation> {
         self.pending.as_ref()
+    }
+    pub fn pending_is_blocked(&self) -> bool {
+        self.pending_blocked
+    }
+    /// Prepare before actual provider I/O. A known receipt may require catch-up;
+    /// a blocked-only intent supplies no receipt or new resolution watermark.
+    pub fn fresh_read(&self) -> Result<Option<ResolutionRead>, Error> {
+        match &self.conflict {
+            Some((original, receipt)) => KnownConflict::restore(
+                original.observation.clone(),
+                &original.operation,
+                original.wire_bytes,
+                receipt,
+            )
+            .and_then(|known| known.fresh_read(&self.current))
+            .map_err(|_| Error::Invalid),
+            None => {
+                let original = self.pending.as_ref().ok_or(Error::Invalid)?;
+                ResolutionRead::blocked_intent(
+                    original.observation.clone(),
+                    &original.operation,
+                    original.wire_bytes,
+                    &self.current,
+                    self.pending_blocked,
+                )
+                .map(Some)
+                .map_err(|_| Error::Invalid)
+            }
+        }
     }
     pub fn selection(&self) -> &CredentialSelection {
         &self.read.source.selection
@@ -459,6 +489,11 @@ impl VaultClient {
             .pending
             .map(|body| decode_retained(&self.scope, &key, &id, &body))
             .transpose()?;
+        if raw.pending_blocked && pending.is_none()
+            || conflict.is_none() && !(raw.pending_blocked && pending.is_some())
+        {
+            return Err(Error::Invalid);
+        }
         if pending.as_ref().is_some_and(|value| {
             current.version.pending_id.as_deref() != Some(value.operation.operation.id.as_str())
         }) {
@@ -470,6 +505,7 @@ impl VaultClient {
             current,
             conflict,
             pending,
+            pending_blocked: raw.pending_blocked,
             guard: raw.guard,
         })
     }
@@ -494,11 +530,13 @@ impl VaultClient {
         {
             return Ok(RepositoryPublication::SourceChanged);
         }
-        // A blocked-only local intent has no retained conflict receipt. It must
-        // use its own explicit transition, never a fabricated KnownConflict.
-        let Some((_, receipt)) = &resolution.conflict else {
-            return Err(Error::Busy);
-        };
+        let receipt_seq = resolution
+            .conflict
+            .as_ref()
+            .map(|(_, receipt)| receipt.server_seq);
+        if receipt_seq.is_none() && !(resolution.pending_blocked && resolution.pending.is_some()) {
+            return Err(Error::Invalid);
+        }
         let candidate = reread.confirm(fresh.clone()).map_err(|_| Error::Invalid)?;
         let current = self
             .repository_observation_inner(read, &fresh.key())
@@ -528,8 +566,10 @@ impl VaultClient {
             }
         };
         if !guard.matches(&resolution.current)
-            || guard.through_seq != receipt.server_seq
-            || guard.through_seq > resolution.guard.lifecycle.resolved_through_seq
+            || guard.receipt_seq != receipt_seq
+            || guard
+                .receipt_seq
+                .is_some_and(|seq| seq > resolution.guard.lifecycle.resolved_through_seq)
         {
             return Err(Error::Invalid);
         }
