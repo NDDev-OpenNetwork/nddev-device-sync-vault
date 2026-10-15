@@ -105,12 +105,15 @@ pub(crate) enum Command {
     ObservationBaselines {
         selected: nddev_device_sync_domain::repositories::catalog::CredentialSelection,
     },
-    EnqueueObservation {
+    // A distinct IPC command makes older workers reject the combined guard
+    // instead of silently ignoring an added field on the old command.
+    EnqueueObservedWriter {
         body: Vec<u8>,
         expected_revision: u64,
         expected_pending: Option<String>,
         selected: nddev_device_sync_domain::repositories::catalog::CredentialSelection,
         selected_operation: Vec<u8>,
+        writer: crate::journal::WriterEnqueueGuard,
     },
     Entity {
         kind: String,
@@ -171,7 +174,7 @@ impl Command {
             Self::Cursor => "vault.storage.cursor",
             Self::ObservationTarget { .. } => "vault.storage.observation_target",
             Self::ObservationBaselines { .. } => "vault.storage.observation_baselines",
-            Self::EnqueueObservation { .. } => "vault.storage.enqueue_observation",
+            Self::EnqueueObservedWriter { .. } => "vault.storage.enqueue_observation",
             Self::Entity { .. } => "vault.storage.entity",
             Self::Records { .. } => "vault.storage.records",
             Self::Resolution { .. } => "vault.storage.resolution",
@@ -348,18 +351,20 @@ pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Erro
         Command::ObservationBaselines { selected } => {
             Reply::ObservationBaselines(journal.observation_baselines(&selected)?)
         }
-        Command::EnqueueObservation {
+        Command::EnqueueObservedWriter {
             body,
             expected_revision,
             expected_pending,
             selected,
             selected_operation,
+            writer,
         } => Reply::Enqueued(journal.enqueue_observation(
             body,
             expected_revision,
             expected_pending,
             &selected,
             &selected_operation,
+            &writer,
         )?),
         Command::Entity { kind, id } => Reply::Entity(journal.entity(&kind, &id)?),
         Command::Records { after } => {

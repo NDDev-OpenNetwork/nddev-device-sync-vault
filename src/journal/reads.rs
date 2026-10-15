@@ -125,19 +125,12 @@ impl Journal {
         {
             return Err(Error::Busy);
         }
-        let (cursor, local_revision) = tx
-            .query_row(
-                "SELECT cursor,local_revision FROM v3_meta WHERE singleton=1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(sql_failed)?;
+        let writer = writer::read(&tx)?;
         tx.commit().map_err(sql_failed)?;
         Ok(ObservationBaselines {
             selected_operation,
             targets,
-            cursor,
-            local_revision,
+            writer,
         })
     }
     pub fn cursor(&self) -> Result<u64, Error> {

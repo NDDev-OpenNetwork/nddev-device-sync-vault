@@ -75,8 +75,7 @@ pub struct ObservationBaselines {
     // same-transaction source-body expectation. No credential bytes.
     pub selected_operation: Vec<u8>,
     pub targets: Vec<ObservationMetadata>,
-    pub cursor: u64,
-    pub local_revision: u64,
+    pub(crate) writer: WriterSnapshot,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Pending {

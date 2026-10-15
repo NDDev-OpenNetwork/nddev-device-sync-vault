@@ -53,15 +53,16 @@ impl Journal {
             None,
         )
     }
-    /// Ordinary captured observations only. Conflict-only resolution awaits
-    /// Root's combined outer lifecycle/atomic transition; no bypass here.
-    pub fn enqueue_observation(
+    /// The source selection and prepared writer facts must still match in the
+    /// same transaction. Conflict settlement uses its own reviewed transition.
+    pub(crate) fn enqueue_observation(
         &self,
         body: Vec<u8>,
         expected_revision: u64,
         expected_pending: Option<String>,
         selected: &nddev_device_sync_domain::repositories::catalog::CredentialSelection,
         selected_operation: &[u8],
+        writer: &WriterEnqueueGuard,
     ) -> Result<Enqueued, Error> {
         self.enqueue_checked(
             body,
@@ -69,7 +70,7 @@ impl Journal {
             expected_revision,
             expected_pending,
             Some((selected, selected_operation)),
-            None,
+            Some(writer),
         )
     }
     pub(crate) fn enqueue_writer(
