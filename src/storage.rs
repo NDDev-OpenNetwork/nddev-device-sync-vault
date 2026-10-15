@@ -102,6 +102,13 @@ pub(crate) enum Command {
     ObservationTarget {
         id: String,
     },
+    RepositoryPage {
+        after: String,
+    },
+    RepositoryOwners {
+        ids: Vec<String>,
+        expected: u64,
+    },
     ObservationBaselines {
         selected: nddev_device_sync_domain::repositories::catalog::CredentialSelection,
     },
@@ -173,6 +180,8 @@ impl Command {
             Self::Pending => "vault.storage.claim",
             Self::Cursor => "vault.storage.cursor",
             Self::ObservationTarget { .. } => "vault.storage.observation_target",
+            Self::RepositoryPage { .. } => "vault.storage.repository_page",
+            Self::RepositoryOwners { .. } => "vault.storage.repository_owners",
             Self::ObservationBaselines { .. } => "vault.storage.observation_baselines",
             Self::EnqueueObservedWriter { .. } => "vault.storage.enqueue_observation",
             Self::Entity { .. } => "vault.storage.entity",
@@ -217,6 +226,7 @@ pub(crate) enum Reply {
     Cursor(u64),
     ObservationBaselines(ObservationBaselines),
     ObservationTarget(ObservationTarget),
+    CatalogRows(crate::journal::CatalogRows),
     Entity(Option<Entity>),
     Records(Vec<RecordEntry>, u64, u64),
     Resolution(Entity, Option<Vec<u8>>, crate::journal::ResolutionGuard),
@@ -229,6 +239,10 @@ pub(crate) enum Reply {
 
 pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Error> {
     Ok(match command {
+        Command::RepositoryPage { after } => Reply::CatalogRows(journal.repository_page(&after)?),
+        Command::RepositoryOwners { ids, expected } => {
+            Reply::CatalogRows(journal.repository_owners(&ids, expected)?)
+        }
         Command::EditTarget { kind, id, known } => {
             Reply::EditTarget(journal.edit_target(&kind, &id, known)?)
         }

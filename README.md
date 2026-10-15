@@ -47,6 +47,13 @@ provider read. This API does not itself run a catalog scan, resolve conflicts or
 synchronize Git repositories. A dispatched transaction retains its completion
 owner after its caller stops waiting.
 
+Saved catalog reads use local authorization and the retained Vault key without
+calling GitHub or resolving a GitHub credential. Each bounded repository page
+joins only its referenced owner observations under the existing local revision;
+a concurrent mutation returns Busy for a fresh read. Missing owner records stay
+absent. The opaque continuation is replica-scoped; every page reports its own
+observed cursor/revision and original timestamps, not current provider freshness.
+
 Run `just check`. The ignored native acceptance requires an explicitly started isolated PostgreSQL/Mailpit fixture and unlocked native credential service; set `NDS_FIXTURE_RECEIPT` and run `just native-acceptance`. Host checks do not prove another platform's secure-store or UI behavior.
 
 Vault record lists use 50-entity keyset pages with explicit continuation, including

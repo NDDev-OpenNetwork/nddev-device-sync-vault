@@ -1799,4 +1799,6 @@ pub(crate) mod history_replica;
 
 #[path = "repository_client.rs"]
 mod repository;
-pub use repository::{RepositoryPublication, RepositoryRead};
+pub use repository::{
+    RepositoryCatalogCursor, RepositoryCatalogPage, RepositoryPublication, RepositoryRead,
+};

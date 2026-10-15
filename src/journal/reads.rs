@@ -46,6 +46,60 @@ pub(super) fn selected_current(
     Ok(record)
 }
 impl Journal {
+    pub(crate) fn repository_page(&self, after: &str) -> Result<CatalogRows, Error> {
+        if !after.is_empty()
+            && (nddev_device_sync_domain::ModuleId::new(after).is_err()
+                || !after.starts_with("github:repo:"))
+        {
+            return Err(Error::Invalid);
+        }
+        self.read(|connection| {
+            let (cursor, local_revision) = catalog_revision(connection)?;
+            let mut query = connection.prepare(
+                "SELECT id,revision,body,server_seq,conflicted,pending_id,next_base FROM local_entities WHERE kind='repository_state' AND id GLOB 'github:repo:*' AND id>?1 ORDER BY id LIMIT ?2",
+            ).map_err(sql_failed)?;
+            let entries = query.query_map(
+                params![after, (nddev_device_sync_domain::repositories::catalog::REPOSITORIES_PER_PAGE + 1) as u32],
+                read_catalog_entry,
+            ).map_err(sql_failed)?.collect::<Result<Vec<_>, _>>().map_err(sql_failed)?;
+            Ok(CatalogRows { entries, cursor, local_revision })
+        })
+    }
+    /// Resolve this page's owner headers under the same observed local revision.
+    /// No transaction remains open while the main Rust owner decrypts the page.
+    pub(crate) fn repository_owners(
+        &self,
+        ids: &[String],
+        expected: u64,
+    ) -> Result<CatalogRows, Error> {
+        let unique = ids.iter().collect::<std::collections::BTreeSet<_>>();
+        if ids.len() > nddev_device_sync_domain::repositories::catalog::REPOSITORIES_PER_PAGE
+            || unique.len() != ids.len()
+            || ids.iter().any(|id| {
+                nddev_device_sync_domain::ModuleId::new(id.as_str()).is_err()
+                    || !id.starts_with("github:owner:")
+            })
+        {
+            return Err(Error::Invalid);
+        }
+        self.read(|connection| {
+            let (cursor, local_revision) = catalog_revision(connection)?;
+            if local_revision != expected {
+                return Err(Error::Busy);
+            }
+            let mut entries = Vec::new();
+            for id in ids {
+                if let Some(value) = entity(connection, "repository_state", id)? {
+                    entries.push((id.clone(), value));
+                }
+            }
+            Ok(CatalogRows {
+                entries,
+                cursor,
+                local_revision,
+            })
+        })
+    }
     pub(crate) fn edit_target(
         &self,
         kind: &str,
@@ -275,4 +329,27 @@ impl Journal {
         tx.commit().map_err(sql_failed)?;
         Ok(changed)
     }
+}
+
+fn catalog_revision(connection: &Connection) -> Result<(u64, u64), Error> {
+    connection
+        .query_row(
+            "SELECT cursor,local_revision FROM v3_meta WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(sql_failed)
+}
+fn read_catalog_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, Entity)> {
+    Ok((
+        row.get(0)?,
+        Entity {
+            revision: row.get(1)?,
+            body: row.get(2)?,
+            server_seq: row.get(3)?,
+            conflicted: row.get(4)?,
+            pending_id: row.get(5)?,
+            next_base: row.get(6)?,
+        },
+    ))
 }

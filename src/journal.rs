@@ -56,6 +56,12 @@ pub struct ObservationTarget {
     pub effective: Option<Entity>,
     pub cursor: u64,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct CatalogRows {
+    pub entries: Vec<(String, Entity)>,
+    pub cursor: u64,
+    pub local_revision: u64,
+}
 // Mechanical IPC metadata projection for NdsClient::CatalogPort.
 // No payload, keys or domain decisions are carried by this read.
 #[derive(serde::Serialize, serde::Deserialize)]

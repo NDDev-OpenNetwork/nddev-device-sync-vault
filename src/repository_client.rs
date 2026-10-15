@@ -5,7 +5,7 @@ use super::*;
 use nddev_device_sync_accounts::LocalUseFence;
 use nddev_device_sync_domain::repositories::catalog::observations::{
     Candidate, ObservationContext, ObservationKey, ObservedTarget, PublicationDecision,
-    TargetVersion,
+    RepositoryObservation, TargetVersion,
 };
 use std::collections::BTreeMap;
 
@@ -53,53 +53,187 @@ pub enum RepositoryPublication {
     SourceChanged,
 }
 
+/// A local keyset position, bound to the encrypted replica scope. It is not
+/// transferable authorization and carries no provider cursor or credential.
+#[derive(Clone)]
+pub struct RepositoryCatalogCursor {
+    scope: Scope,
+    after: String,
+}
+pub struct RepositoryCatalogPage {
+    pub observations: Vec<(ObservedTarget, u64)>,
+    pub next: Option<RepositoryCatalogCursor>,
+    pub observed_seq: u64,
+    pub local_revision: u64,
+}
+
+fn decode_catalog_entity(
+    scope: &Scope,
+    key: &VaultKey,
+    expected_id: &str,
+    entity: crate::journal::Entity,
+    history_cursor: u64,
+) -> Result<(ObservedTarget, u64), Error> {
+    let operation = codec::versioned(&entity.body)?;
+    if operation.operation.entity_kind != EntityKind::RepositoryState
+        || operation.operation.entity_id != expected_id
+    {
+        return Err(Error::Invalid);
+    }
+    let plaintext = key.decrypt_versioned(scope, &operation)?;
+    let snapshot: Snapshot = serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
+    snapshot
+        .validate(
+            &operation.operation.device,
+            EntityKind::RepositoryState,
+            expected_id,
+        )
+        .map_err(|_| Error::Invalid)?;
+    let State::Repository { observation } = snapshot.data else {
+        return Err(Error::Invalid);
+    };
+    let version = TargetVersion {
+        revision: entity.revision,
+        next_base: entity.next_base,
+        pending_id: entity.pending_id,
+        conflicted: entity.conflicted,
+    };
+    version.validate().map_err(|_| Error::Invalid)?;
+    Ok((
+        ObservedTarget {
+            key: observation.key(),
+            version,
+            value: Some(observation),
+            history_cursor,
+        },
+        snapshot.observed_at_ms,
+    ))
+}
+
 fn decode_target(
     scope: &Scope,
     key: &VaultKey,
     expected: &ObservationKey,
     target: crate::journal::ObservationTarget,
 ) -> Result<ObservedTarget, Error> {
-    let (version, value) = match target.effective {
-        None => (TargetVersion::absent(), None),
+    match target.effective {
         Some(entity) => {
-            let operation = codec::versioned(&entity.body)?;
-            if operation.operation.entity_kind != EntityKind::RepositoryState
-                || operation.operation.entity_id != expected.entity_id()
-            {
-                return Err(Error::Invalid);
-            }
-            let plaintext = key.decrypt_versioned(scope, &operation)?;
-            let snapshot: Snapshot =
-                serde_json::from_slice(&plaintext).map_err(|_| Error::Invalid)?;
-            snapshot
-                .validate(
-                    &operation.operation.device,
-                    EntityKind::RepositoryState,
-                    &expected.entity_id(),
-                )
-                .map_err(|_| Error::Invalid)?;
-            let State::Repository { observation } = snapshot.data else {
-                return Err(Error::Invalid);
-            };
-            let version = TargetVersion {
-                revision: entity.revision,
-                next_base: entity.next_base,
-                pending_id: entity.pending_id,
-                conflicted: entity.conflicted,
-            };
-            version.validate().map_err(|_| Error::Invalid)?;
-            (version, Some(observation))
+            decode_catalog_entity(scope, key, &expected.entity_id(), entity, target.cursor)
+                .map(|(value, _)| value)
         }
-    };
-    Ok(ObservedTarget {
-        key: expected.clone(),
-        version,
-        value,
-        history_cursor: target.cursor,
-    })
+        None => Ok(ObservedTarget {
+            key: expected.clone(),
+            version: TargetVersion::absent(),
+            value: None,
+            history_cursor: target.cursor,
+        }),
+    }
 }
 
 impl VaultClient {
+    /// Read saved facts without GitHub I/O or a selected GitHub credential.
+    /// Native/browser authorization and the original local-use fence still apply.
+    /// Pages are individually consistent local observations, not a frozen catalog
+    /// snapshot or proof of current provider access.
+    pub async fn repository_catalog_page(
+        &self,
+        after: Option<&RepositoryCatalogCursor>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<RepositoryCatalogPage, Error> {
+        use nddev_device_sync_domain::repositories::catalog::{
+            REPOSITORIES_PER_PAGE, observations::ObservationData,
+        };
+        let check = || {
+            if cancellation.is_cancelled() {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        };
+        check()?;
+        let _permit = self.admitted()?;
+        if after.is_some_and(|cursor| cursor.scope != self.scope) {
+            return Err(Error::Invalid);
+        }
+        let fence = self
+            .identity
+            .local_use_fence()
+            .await
+            .map_err(identity_failure)?;
+        let key = self.key().await?.ok_or(Error::Locked)?;
+        check()?;
+        let mut raw = match self
+            .journal
+            .call(crate::storage::Command::RepositoryPage {
+                after: after.map_or_else(String::new, |cursor| cursor.after.clone()),
+            })
+            .await?
+        {
+            crate::storage::Reply::CatalogRows(value) => value,
+            _ => return Err(Error::Invalid),
+        };
+        check()?;
+        let more = raw.entries.len() > REPOSITORIES_PER_PAGE;
+        raw.entries.truncate(REPOSITORIES_PER_PAGE);
+        let next = if more {
+            raw.entries.last().map(|(id, _)| RepositoryCatalogCursor {
+                scope: self.scope.clone(),
+                after: id.clone(),
+            })
+        } else {
+            None
+        };
+        let mut observations = Vec::new();
+        let mut owners = std::collections::BTreeSet::new();
+        for (id, entity) in raw.entries {
+            let value = decode_catalog_entity(&self.scope, &key, &id, entity, raw.cursor)?;
+            let Some(RepositoryObservation {
+                data: ObservationData::Repository { repository },
+                ..
+            }) = &value.0.value
+            else {
+                return Err(Error::Invalid);
+            };
+            owners.insert(ObservationKey::Owner(repository.owner_id).entity_id());
+            observations.push(value);
+        }
+        let owner_rows = match self
+            .journal
+            .call(crate::storage::Command::RepositoryOwners {
+                ids: owners.into_iter().collect(),
+                expected: raw.local_revision,
+            })
+            .await?
+        {
+            crate::storage::Reply::CatalogRows(value) => value,
+            _ => return Err(Error::Invalid),
+        };
+        check()?;
+        for (id, entity) in owner_rows.entries {
+            let value = decode_catalog_entity(&self.scope, &key, &id, entity, raw.cursor)?;
+            if !matches!(
+                &value.0.value,
+                Some(RepositoryObservation {
+                    data: ObservationData::Owner { .. },
+                    ..
+                })
+            ) {
+                return Err(Error::Invalid);
+            }
+            observations.push(value);
+        }
+        self.identity
+            .validate_local_use(&fence)
+            .await
+            .map_err(identity_failure)?;
+        check()?;
+        Ok(RepositoryCatalogPage {
+            observations,
+            next,
+            observed_seq: raw.cursor,
+            local_revision: raw.local_revision,
+        })
+    }
     /// Capture local target metadata before GitHub I/O, without holding a store
     /// lock across that I/O. The caller supplies its original identity fence.
     pub async fn capture_repository_observations(
@@ -375,6 +509,17 @@ mod tests {
         let decoded = decode_target(&scope, &key, &expected, target()).unwrap();
         assert_eq!(decoded.history_cursor, 2);
         assert_eq!(decoded.value.unwrap().key(), expected);
+        let (saved, observed_at_ms) = decode_catalog_entity(
+            &scope,
+            &key,
+            &expected.entity_id(),
+            target().effective.unwrap(),
+            2,
+        )
+        .unwrap();
+        assert_eq!(observed_at_ms, 42);
+        assert_eq!(saved.version.revision, 1);
+        assert_eq!(saved.history_cursor, 2);
         assert!(matches!(
             decode_target(
                 &scope,

@@ -53,16 +53,11 @@ fn observed_repository(
     operation_id: &str,
     repository_id: u64,
 ) -> Vec<u8> {
-    let observation = RepositoryObservation {
-        source: ObservationSource {
-            context: ObservationContext {
-                principal: GithubAccountId::new(1).unwrap(),
-                selection: selected.clone(),
-                scan_id: "owned-scan".into(),
-            },
-            page: Some(1),
-        },
-        data: ObservationData::Repository {
+    observed_data(
+        key,
+        selected,
+        operation_id,
+        ObservationData::Repository {
             repository: RepositoryFact {
                 id: RepositoryId::new(repository_id).unwrap(),
                 owner_id: GithubAccountId::new(1).unwrap(),
@@ -72,6 +67,24 @@ fn observed_repository(
                 default_branch: Some("main".into()),
             },
         },
+    )
+}
+fn observed_data(
+    key: &VaultKey,
+    selected: &CredentialSelection,
+    operation_id: &str,
+    data: ObservationData,
+) -> Vec<u8> {
+    let observation = RepositoryObservation {
+        source: ObservationSource {
+            context: ObservationContext {
+                principal: GithubAccountId::new(1).unwrap(),
+                selection: selected.clone(),
+                scan_id: "owned-scan".into(),
+            },
+            page: Some(1),
+        },
+        data,
     };
     let entity_id = observation.key().entity_id();
     let snapshot = Snapshot {
@@ -390,4 +403,120 @@ fn observation_window_is_transactional_and_preserves_replacement_and_other_write
         )
         .unwrap();
     assert_eq!(other.stats().unwrap().0, 34);
+}
+
+#[test]
+fn saved_catalog_pages_survive_reopen_and_owner_reads_reject_revision_drift() {
+    let (owned, journal, key, selected, before) = setup();
+    let writer = guard(&key, &before);
+    for id in 1..=30 {
+        journal
+            .enqueue_observation(
+                observed_repository(&key, &selected, &format!("observation-{id}"), id),
+                0,
+                None,
+                &selected,
+                &before.selected_operation,
+                &writer,
+            )
+            .unwrap();
+    }
+    let reopened = Journal::open(owned.0.join("replica.db")).unwrap();
+    let mut first = reopened.repository_page("").unwrap();
+    assert_eq!(first.entries.len(), 26);
+    first.entries.truncate(25);
+    let last = first.entries.last().unwrap().0.clone();
+    let next = reopened.repository_page(&last).unwrap();
+    assert_eq!(next.entries.len(), 5);
+    let ids = first
+        .entries
+        .iter()
+        .chain(&next.entries)
+        .map(|(id, _)| id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids.len(), 30);
+    assert_eq!(first.cursor, next.cursor);
+    assert_eq!(first.local_revision, next.local_revision);
+    let owners = vec!["github:owner:1".into()];
+    assert!(
+        reopened
+            .repository_owners(&owners, first.local_revision)
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    let owner_body = observed_data(
+        &key,
+        &selected,
+        "owner-profile",
+        ObservationData::Owner {
+            owner: GithubOwner {
+                id: GithubAccountId::new(1).unwrap(),
+                kind: GithubOwnerKind::Organization,
+                login: "observed-owner".into(),
+            },
+        },
+    );
+    journal
+        .enqueue_observation(
+            owner_body.clone(),
+            0,
+            None,
+            &selected,
+            &before.selected_operation,
+            &writer,
+        )
+        .unwrap();
+    assert!(matches!(
+        reopened.repository_owners(&owners, first.local_revision),
+        Err(Error::Busy)
+    ));
+    let refreshed = reopened.repository_page("").unwrap();
+    let joined = reopened
+        .repository_owners(&owners, refreshed.local_revision)
+        .unwrap();
+    assert_eq!(joined.entries.len(), 1);
+    assert_eq!(joined.entries[0].0, "github:owner:1");
+    assert_eq!(joined.entries[0].1.body, owner_body);
+    let decoded = crate::codec::versioned(&joined.entries[0].1.body).unwrap();
+    let plain = key.decrypt_versioned(&scope(), &decoded).unwrap();
+    let snapshot: Snapshot = serde_json::from_slice(&plain).unwrap();
+    snapshot
+        .validate(
+            &decoded.operation.device,
+            EntityKind::RepositoryState,
+            &joined.entries[0].0,
+        )
+        .unwrap();
+    // An ordinary concurrent write must invalidate the second half of a read.
+    journal
+        .enqueue(
+            super::checkpoint::valid_legacy_record_body(&key, "later-record", "later", 0),
+            None,
+            0,
+            None,
+        )
+        .unwrap();
+    assert!(matches!(
+        reopened.repository_owners(&owners, refreshed.local_revision),
+        Err(Error::Busy)
+    ));
+    let too_many = (1..=26)
+        .map(|id| format!("github:owner:{id}"))
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        reopened.repository_owners(&too_many, first.local_revision),
+        Err(Error::Invalid)
+    ));
+    assert!(matches!(
+        reopened.repository_owners(
+            &["github:owner:1".into(), "github:owner:1".into()],
+            first.local_revision
+        ),
+        Err(Error::Invalid)
+    ));
+    assert!(matches!(
+        reopened.repository_owners(&["github:repo:1".into()], first.local_revision),
+        Err(Error::Invalid)
+    ));
 }
