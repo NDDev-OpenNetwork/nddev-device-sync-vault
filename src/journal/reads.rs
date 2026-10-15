@@ -232,11 +232,17 @@ impl Journal {
             if dispatched { return Err(Error::Busy); }
             let (committed, conflict, guard) = resolution_evidence(connection, "repository_state", id)?;
             target.body = committed;
-            let pending = target.pending_id.as_ref().map(|id| {
-                connection.query_row("SELECT body FROM v3_outbox WHERE id=?1 AND dispatched=0", [id], |r| r.get(0)).map_err(sql_failed)
+            let pending: Option<(Vec<u8>, String)> = target.pending_id.as_ref().map(|id| {
+                connection.query_row("SELECT body,state FROM v3_outbox WHERE id=?1 AND dispatched=0", [id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(sql_failed)
             }).transpose()?;
+            let (pending, pending_blocked) = match pending {
+                Some((body, state)) if state == "conflict" => (Some(body), true),
+                Some((body, state)) if state == "pending" => (Some(body), false),
+                Some(_) => return Err(Error::Invalid),
+                None => (None, false),
+            };
             if conflict.is_none() && pending.is_none() { return Err(Error::Invalid); }
-            Ok(ObservationResolution { target, conflict, pending, guard })
+            Ok(ObservationResolution { target, conflict, pending, pending_blocked, guard })
         })
     }
 

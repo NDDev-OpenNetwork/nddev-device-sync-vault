@@ -11,7 +11,7 @@ default = []
 development-http = ["nddev-device-sync-accounts/development-http"]
 
 [dependencies]
-nddev-device-sync-application = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "9db6396c0789ca1ca0fa6e1ffe3d4e666886328f" }
+nddev-device-sync-application = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "889f0f4a9b6416e92eaaac111471a9d700ef8468" }
 base64 = "0.22"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
@@ -22,7 +22,7 @@ tracing = "0.1"
 nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "38f48cf88fb2222d2ccde22460a8f2f564f8e47b" }
 time = { version = "0.3", features = ["wasm-bindgen"] }
 uuid = { version = "1.27", features = ["v4"] }
-nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "9db6396c0789ca1ca0fa6e1ffe3d4e666886328f" }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "889f0f4a9b6416e92eaaac111471a9d700ef8468" }
 nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "aa387beaf08ba53ec630d6fb64b6861f7075486b" }
 
 tokio = { version = "1.53", features = ["rt", "sync", "time"] }
@@ -53,5 +53,5 @@ ring = { version="0.17",features=["wasm32_unknown_unknown_js"] }
 # ponytail (Core adoption): normalize immutable transitive legacy URLs to this
 # root's canonical Core source. Remove when all transitive manifests use it.
 [patch."https://github.com/NDDev-OpenNetwork/nddev-device-sync-core.git"]
-nddev-device-sync-application = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "9db6396c0789ca1ca0fa6e1ffe3d4e666886328f" }
-nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "9db6396c0789ca1ca0fa6e1ffe3d4e666886328f" }
+nddev-device-sync-application = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "889f0f4a9b6416e92eaaac111471a9d700ef8468" }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "889f0f4a9b6416e92eaaac111471a9d700ef8468" }

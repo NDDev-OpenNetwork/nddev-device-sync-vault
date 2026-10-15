@@ -131,5 +131,7 @@ Core, then queues a new operation against the observed committed revision. Its
 separate storage command rechecks source, writer, cursor/local revision and all
 scoped lifecycle witnesses together. The old conflict survives queueing/reopen
 and another Conflict receipt; only the actual Applied receipt retires it.
-Blocked-only intents have no server conflict receipt and still need their own
-explicit transition. The automatic catalog caller has not yet adopted resolution.
+Blocked undispatched intents without a server receipt use the same explicit
+fresh-read transition, preserving the committed lifecycle without inventing a
+receipt or deriving it from the cursor. The automatic catalog caller has not
+yet adopted resolution.
