@@ -61,6 +61,7 @@ pub(crate) struct ObservationResolution {
     pub target: Entity,
     pub conflict: Option<RawRow>,
     pub pending: Option<Vec<u8>>,
+    pub pending_blocked: bool,
     pub guard: ResolutionGuard,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
