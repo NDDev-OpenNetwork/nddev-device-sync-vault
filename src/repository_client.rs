@@ -338,6 +338,40 @@ impl VaultClient {
         result
     }
 
+    /// Read previous saved scope evidence under the original pre-provider guard.
+    /// The result cannot replace that read's captured target version for writing.
+    pub async fn repository_observation(
+        &self,
+        read: &RepositoryRead,
+        key: &ObservationKey,
+    ) -> Result<ObservedTarget, Error> {
+        let _permit = self.admitted()?;
+        self.repository_observation_inner(read, key).await
+    }
+
+    async fn repository_observation_inner(
+        &self,
+        read: &RepositoryRead,
+        expected: &ObservationKey,
+    ) -> Result<ObservedTarget, Error> {
+        expected.validate().map_err(|_| Error::Invalid)?;
+        self.validate_repository_read(read).await?;
+        let key = self.key().await?.ok_or(Error::Locked)?;
+        let target = match self
+            .journal
+            .call(crate::storage::Command::ObservationTarget {
+                id: expected.entity_id(),
+            })
+            .await?
+        {
+            crate::storage::Reply::ObservationTarget(target) => target,
+            _ => return Err(Error::Invalid),
+        };
+        let current = decode_target(&self.scope, &key, expected, target)?;
+        self.validate_repository_read(read).await?;
+        Ok(current)
+    }
+
     /// Apply only a candidate captured by the original pre-provider read. Equal
     /// facts cause no encryption or journal write. A changed target must be read
     /// from the provider again; this API never rebases a candidate or resolves a
@@ -377,18 +411,9 @@ impl VaultClient {
                 &id,
             )
             .map_err(|_| Error::Invalid)?;
-        self.validate_repository_read(read).await?;
-        let key = self.key().await?.ok_or(Error::Locked)?;
-        let target = match self
-            .journal
-            .call(crate::storage::Command::ObservationTarget { id })
-            .await?
-        {
-            crate::storage::Reply::ObservationTarget(target) => target,
-            _ => return Err(Error::Invalid),
-        };
-        let current = decode_target(&self.scope, &key, &candidate.observation().key(), target)?;
-        self.validate_repository_read(read).await?;
+        let current = self
+            .repository_observation_inner(read, &candidate.observation().key())
+            .await?;
         let candidate = match candidate
             .decide(&current, active)
             .map_err(|_| Error::Invalid)?

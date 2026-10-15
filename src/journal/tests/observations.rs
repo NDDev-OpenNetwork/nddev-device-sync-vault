@@ -520,3 +520,64 @@ fn saved_catalog_pages_survive_reopen_and_owner_reads_reject_revision_drift() {
         Err(Error::Invalid)
     ));
 }
+
+#[test]
+fn partial_scope_summary_retains_encrypted_completion_evidence_after_reopen() {
+    let (owned, journal, key, selected, before) = setup();
+    let scan = ScopeScan {
+        outcome: TraversalOutcome::Partial,
+        pages: 1,
+        repositories: 1,
+        last_complete: Some(CompleteTraversal {
+            pages: 3,
+            repositories: 50,
+            observed_at_ms: 99,
+            scan_id: "earlier".into(),
+        }),
+    };
+    let body = observed_data(
+        &key,
+        &selected,
+        "scope-summary",
+        ObservationData::ScopeScan { scan: scan.clone() },
+    );
+    journal
+        .enqueue_observation(
+            body.clone(),
+            0,
+            None,
+            &selected,
+            &before.selected_operation,
+            &guard(&key, &before),
+        )
+        .unwrap();
+    let reopened = Journal::open(owned.0.join("replica.db")).unwrap();
+    let id = ObservationKey::Scope {
+        principal: GithubAccountId::new(1).unwrap(),
+        record_ref: "credential".into(),
+    }
+    .entity_id();
+    let target = reopened.observation_target(&id).unwrap().effective.unwrap();
+    assert_eq!(target.body, body);
+    let operation = crate::codec::versioned(&target.body).unwrap();
+    let plaintext = key.decrypt_versioned(&scope(), &operation).unwrap();
+    let snapshot: Snapshot = serde_json::from_slice(&plaintext).unwrap();
+    snapshot
+        .validate(
+            &operation.operation.device,
+            EntityKind::RepositoryState,
+            &id,
+        )
+        .unwrap();
+    let State::Repository { observation } = snapshot.data else {
+        panic!()
+    };
+    assert_eq!(observation.data, ObservationData::ScopeScan { scan });
+    let baseline = reopened.observation_baselines(&selected).unwrap();
+    let summary = baseline
+        .targets
+        .iter()
+        .find(|target| target.id == id)
+        .unwrap();
+    assert_eq!(summary.pending_id.as_deref(), Some("v3:42:scope-summary"));
+}
