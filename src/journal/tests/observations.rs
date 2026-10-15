@@ -44,6 +44,15 @@ fn guard(key: &VaultKey, baseline: &ObservationBaselines) -> WriterEnqueueGuard 
 }
 
 fn observed(key: &VaultKey, selected: &CredentialSelection, operation_id: &str) -> Vec<u8> {
+    observed_repository(key, selected, operation_id, 9)
+}
+
+fn observed_repository(
+    key: &VaultKey,
+    selected: &CredentialSelection,
+    operation_id: &str,
+    repository_id: u64,
+) -> Vec<u8> {
     let observation = RepositoryObservation {
         source: ObservationSource {
             context: ObservationContext {
@@ -55,7 +64,7 @@ fn observed(key: &VaultKey, selected: &CredentialSelection, operation_id: &str) 
         },
         data: ObservationData::Repository {
             repository: RepositoryFact {
-                id: RepositoryId::new(9).unwrap(),
+                id: RepositoryId::new(repository_id).unwrap(),
                 owner_id: GithubAccountId::new(1).unwrap(),
                 name: "private-repository-observation".into(),
                 visibility: RepositoryVisibility::Private,
@@ -294,4 +303,91 @@ fn combined_guard_cannot_be_downgraded_to_the_older_storage_command() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn selected_ciphertext_must_be_bound_to_its_record_identity() {
+    let (owned, journal, key, selected, _before) = setup();
+    let foreign =
+        super::checkpoint::valid_legacy_record_body(&key, "credential-op", "other-record", 0);
+    let connection = Connection::open(owned.0.join("replica.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE v3_outbox SET body=?1 WHERE id='credential-op'",
+            [&foreign],
+        )
+        .unwrap();
+    assert!(matches!(
+        journal.observation_baselines(&selected),
+        Err(Error::Invalid)
+    ));
+}
+
+#[test]
+fn observation_window_is_transactional_and_preserves_replacement_and_other_writes() {
+    let (owned, journal, key, selected, before) = setup();
+    let writer = guard(&key, &before);
+    for id in 1..=32 {
+        journal
+            .enqueue_observation(
+                observed_repository(&key, &selected, &format!("observation-{id}"), id),
+                0,
+                None,
+                &selected,
+                &before.selected_operation,
+                &writer,
+            )
+            .unwrap();
+    }
+    // A second connection must observe the first producer's completed writes.
+    let other = Journal::open(owned.0.join("replica.db")).unwrap();
+    let stats = other.stats().unwrap();
+    assert_eq!(stats.0, 33); // 32 observations plus the selected credential.
+    assert!(matches!(
+        other.enqueue_observation(
+            observed_repository(&key, &selected, "overflow", 33),
+            0,
+            None,
+            &selected,
+            &before.selected_operation,
+            &writer,
+        ),
+        Err(Error::Busy)
+    ));
+    assert_eq!(other.stats().unwrap(), stats);
+    assert!(
+        other
+            .entity("repository_state", "github:repo:33")
+            .unwrap()
+            .is_none()
+    );
+    let replacement = observed_repository(&key, &selected, "replacement", 1);
+    other
+        .enqueue_observation(
+            replacement.clone(),
+            0,
+            Some("v3:42:observation-1".into()),
+            &selected,
+            &before.selected_operation,
+            &writer,
+        )
+        .unwrap();
+    assert_eq!(other.stats().unwrap().0, 33);
+    assert_eq!(
+        other
+            .entity("repository_state", "github:repo:1")
+            .unwrap()
+            .unwrap()
+            .body,
+        replacement
+    );
+    other
+        .enqueue(
+            super::checkpoint::valid_legacy_record_body(&key, "another-record", "another", 0),
+            None,
+            0,
+            None,
+        )
+        .unwrap();
+    assert_eq!(other.stats().unwrap().0, 34);
 }

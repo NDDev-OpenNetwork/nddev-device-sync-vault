@@ -178,6 +178,25 @@ impl Journal {
         if count >= 1024 {
             return Err(Error::Busy);
         }
+        if selected.is_some() {
+            let observations: usize = tx
+                .query_row(
+                    "SELECT count(*) FROM v3_outbox WHERE kind='repository_state'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(sql_failed)?;
+            // Enforce Core's producer window in the insertion transaction.
+            // Replacing an undispatched value above consumes no additional slot.
+            if nddev_device_sync_application::repositories::catalog::observations::stage_count(
+                1,
+                observations,
+                (1024 - count) as usize,
+            ) == 0
+            {
+                return Err(Error::Busy);
+            }
+        }
         tx.execute("INSERT INTO v3_outbox(id,kind,entity_id,body,state,dispatched,predecessor) VALUES(?1,?2,?3,?4,'pending',0,?5)",params![operation.id,kind,operation.entity_id,body,predecessor]).map_err(sql_failed)?;
         bump(&tx)?;
         let receipt=tx.query_row("SELECT (SELECT count(*) FROM v3_outbox WHERE state='pending'),((SELECT count(*) FROM v3_conflicts)+(SELECT count(*) FROM v3_outbox o WHERE state='conflict' AND NOT EXISTS(SELECT 1 FROM v3_conflicts c WHERE c.kind=o.kind AND c.entity_id=o.entity_id))),cursor,local_revision FROM v3_meta WHERE singleton=1",[],|r|Ok(Enqueued{id:operation.id.clone(),pending:r.get(0)?,conflicts:r.get(1)?,cursor:r.get(2)?,local_revision:r.get(3)?})).map_err(sql_failed)?;

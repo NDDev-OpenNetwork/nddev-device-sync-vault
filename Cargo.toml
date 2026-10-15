@@ -26,6 +26,7 @@ nddev-device-sync-domain = { git = "https://github.com/NDDev-OpenNetwork/nddev-d
 nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "aa387beaf08ba53ec630d6fb64b6861f7075486b" }
 
 tokio = { version = "1.53", features = ["rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]

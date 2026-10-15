@@ -196,6 +196,9 @@ fn completed(
         Ok(_) => {
             tracing::event!(target:"nddev_device_sync_vault",tracing::Level::INFO,{event.name=event,outcome="ok",duration_ms=started.elapsed().as_millis() as u64})
         }
+        Err(Error::Cancelled) => {
+            tracing::event!(target:"nddev_device_sync_vault",tracing::Level::INFO,{event.name=event,outcome="stopped",error.type="vault_cancelled",duration_ms=started.elapsed().as_millis() as u64})
+        }
         Err(error) => {
             tracing::event!(target:"nddev_device_sync_vault",tracing::Level::WARN,{event.name=event,outcome="error",error.type=error.code(),duration_ms=started.elapsed().as_millis() as u64})
         }
@@ -441,6 +444,15 @@ impl Storage {
         }
     }
     pub(crate) async fn call(&self, command: Command) -> Result<Reply, Error> {
+        self.call_guarded(command, || Ok(())).await
+    }
+    /// Synchronous caller guard after admission, before any transaction starts.
+    /// It is not serialized to the worker and must perform no I/O.
+    pub(crate) async fn call_guarded(
+        &self,
+        command: Command,
+        check: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<Reply, Error> {
         let event = command.event();
         let span = nddev_device_sync_telemetry::operation_span("vault", "io")
             .map_err(|_| Error::Unavailable)?;
@@ -458,9 +470,14 @@ impl Storage {
             std::time::Duration::from_millis(500),
             self.io.clone().acquire_owned(),
         )
-        .await
-        .map_err(|_| Error::Busy)?
-        .map_err(|_| Error::Unavailable)?;
+        .await;
+        if let Err(error) = check() {
+            span.in_scope(|| completed(event, started, &Err(error)));
+            return Err(error);
+        }
+        let permit = permit
+            .map_err(|_| Error::Busy)?
+            .map_err(|_| Error::Unavailable)?;
         #[cfg(not(target_arch = "wasm32"))]
         {
             let journal = self.journal.clone();
@@ -582,5 +599,60 @@ impl Storage {
     #[cfg(all(test, not(target_arch = "wasm32")))]
     pub fn path_for_acceptance(&self) -> PathBuf {
         self.journal.path_for_acceptance()
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_guard_after_queue_wait_cannot_start_a_transaction() {
+        struct Owned(PathBuf);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = Owned(
+            std::env::temp_dir().join(format!("nds-storage-admission-{}", uuid::Uuid::new_v4())),
+        );
+        let storage = Arc::new(Storage::open(directory.0.join("replica.db")).await.unwrap());
+        let held = storage.io.clone().acquire_owned().await.unwrap();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancelled = cancellation.clone();
+        let queued = storage.clone();
+        let task = tokio::spawn(async move {
+            queued
+                .call_guarded(Command::CaughtUp { cursor: 0, at: 77 }, || {
+                    if cancelled.is_cancelled() {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while storage.admission.available_permits() == 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancellation.cancel();
+        drop(held);
+        assert!(matches!(task.await.unwrap(), Err(Error::Cancelled)));
+        assert_eq!(storage.journal.stats().unwrap().3, 0);
+        assert_eq!(storage.io.available_permits(), 1);
+        assert_eq!(storage.admission.available_permits(), 4);
+        assert!(matches!(
+            storage
+                .call(Command::CaughtUp { cursor: 0, at: 77 })
+                .await
+                .unwrap(),
+            Reply::Bool(true)
+        ));
+        assert_eq!(storage.journal.stats().unwrap().3, 77);
     }
 }

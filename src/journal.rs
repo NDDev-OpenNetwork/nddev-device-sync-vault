@@ -54,9 +54,6 @@ pub(crate) struct ResolutionGuard {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ObservationTarget {
     pub effective: Option<Entity>,
-    // Exact committed operation bytes: main Rust decodes its eventual outer
-    // lifecycle/header. Never infer it from a pending payload or from cursor.
-    pub committed_operation: Option<Vec<u8>>,
     pub cursor: u64,
 }
 // Mechanical IPC metadata projection for NdsClient::CatalogPort.

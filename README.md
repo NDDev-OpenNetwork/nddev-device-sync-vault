@@ -37,6 +37,16 @@ Unauthorized selections deny use. Rust
 callers recheck around external awaits together with the Accounts local-use
 fence and their cancellation lifetime; no secret or durable guard enters FFI.
 
+The Rust catalog caller captures repository baselines before provider I/O with
+its original Accounts fence, selected record and cancellation token. Publication
+reuses Core's semantic comparison and the ordinary encrypted writer. Source
+selection, ciphertext, writer facts and target revision are checked together in
+the enqueue transaction. Core's 32-operation catalog window is enforced there;
+unchanged facts produce no write, and stale/conflicted targets require a fresh
+provider read. This API does not itself run a catalog scan, resolve conflicts or
+synchronize Git repositories. A dispatched transaction retains its completion
+owner after its caller stops waiting.
+
 Run `just check`. The ignored native acceptance requires an explicitly started isolated PostgreSQL/Mailpit fixture and unlocked native credential service; set `NDS_FIXTURE_RECEIPT` and run `just native-acceptance`. Host checks do not prove another platform's secure-store or UI behavior.
 
 Vault record lists use 50-entity keyset pages with explicit continuation, including

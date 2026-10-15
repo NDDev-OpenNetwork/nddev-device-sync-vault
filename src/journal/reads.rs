@@ -37,6 +37,12 @@ pub(super) fn selected_current(
     {
         return Err(Error::SelectionChanged);
     }
+    let operation = crate::codec::versioned(&record.body)?;
+    if operation.operation.entity_kind != nddev_device_sync_domain::sync::EntityKind::VaultRecord
+        || operation.operation.entity_id != selected.record_ref()
+    {
+        return Err(Error::Invalid);
+    }
     Ok(record)
 }
 impl Journal {
@@ -75,25 +81,13 @@ impl Journal {
         let mut connection = self.connection()?;
         let tx = transaction(&mut connection, TransactionBehavior::Deferred)?;
         let effective = entity(&tx, "repository_state", id)?;
-        let committed_operation = tx
-            .query_row(
-                "SELECT body FROM v3_entities WHERE kind='repository_state' AND id=?1",
-                [id],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()
-            .map_err(sql_failed)?;
         let cursor = tx
             .query_row("SELECT cursor FROM v3_meta WHERE singleton=1", [], |row| {
                 row.get(0)
             })
             .map_err(sql_failed)?;
         tx.commit().map_err(sql_failed)?;
-        Ok(ObservationTarget {
-            effective,
-            committed_operation,
-            cursor,
-        })
+        Ok(ObservationTarget { effective, cursor })
     }
     /// One short metadata/selection transaction before provider I/O.
     /// Canonical key parsing and decisions remain in Core/main Rust.

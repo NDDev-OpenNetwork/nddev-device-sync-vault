@@ -2,7 +2,9 @@
 mod client;
 mod codec;
 mod key_discovery;
-pub use client::{CheckpointStage, InboxProgress, VaultClient};
+pub use client::{
+    CheckpointStage, InboxProgress, RepositoryPublication, RepositoryRead, VaultClient,
+};
 use nddev_device_sync_accounts::sync3_wire;
 pub mod view;
 pub use view::{RecordView, VaultError as Error, VaultView};
