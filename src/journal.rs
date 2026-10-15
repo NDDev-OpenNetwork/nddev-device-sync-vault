@@ -52,6 +52,13 @@ pub(crate) struct ResolutionGuard {
     pub lifecycle: nddev_device_sync_domain::sync::history::Lifecycle,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ObservationResolution {
+    pub target: Entity,
+    pub conflict: Option<RawRow>,
+    pub pending: Option<Vec<u8>>,
+    pub guard: ResolutionGuard,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ObservationTarget {
     pub effective: Option<Entity>,
     pub cursor: u64,

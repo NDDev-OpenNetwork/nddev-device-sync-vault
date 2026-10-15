@@ -209,68 +209,37 @@ impl Journal {
         let tx = transaction(&mut connection, TransactionBehavior::Deferred)?;
         let entity = entity(&tx, "vault_record", id)?.ok_or(Error::Invalid)?;
         let conflict = conflict(&tx, id)?;
-        let (cursor, local_revision, known): (u64, u64, u64) = tx
-            .query_row(
-                "SELECT cursor,local_revision,known_committed_seq FROM v3_meta WHERE singleton=1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .map_err(sql_failed)?;
-        let body: Vec<u8> = tx
-            .query_row(
-                "SELECT body FROM v3_entities WHERE kind='vault_record' AND id=?1",
-                [id],
-                |r| r.get(0),
-            )
-            .map_err(sql_failed)?;
-        let committed = crate::codec::versioned(&body)?;
-        if committed.operation.entity_kind
-            != nddev_device_sync_domain::sync::EntityKind::VaultRecord
-            || committed.operation.entity_id != id
-        {
-            return Err(Error::Invalid);
-        }
-        let mut sequences = Vec::new();
-        {
-            // Decode one original at a time; only bounded receipt sequence
-            // metadata is collected, never a second ciphertext set over IPC.
-            let mut query = tx.prepare(
-                "SELECT body,result FROM v3_conflicts WHERE kind='vault_record' AND entity_id=?1 LIMIT ?2",
-            ).map_err(sql_failed)?;
-            let mut rows = query
-                .query(params![
-                    id,
-                    nddev_device_sync_domain::sync::MAX_OPERATIONS + 1
-                ])
-                .map_err(sql_failed)?;
-            while let Some(row) = rows.next().map_err(sql_failed)? {
-                let body: Vec<u8> = row.get(0).map_err(sql_failed)?;
-                let result: Vec<u8> = row.get(1).map_err(sql_failed)?;
-                let (operation, receipt) = crate::codec::original_receipt(&body, &result, 409)?;
-                if operation.operation.entity_kind != committed.operation.entity_kind
-                    || operation.operation.entity_id != id
-                {
-                    return Err(Error::Invalid);
-                }
-                sequences.push(receipt.server_seq);
-            }
-        }
-        let lifecycle = nddev_device_sync_domain::sync::history::resolution_lifecycle(
-            committed.lifecycle(),
-            &sequences,
-            cursor.max(known),
-        )?;
+        let (_, _, guard) = resolution_evidence(&tx, "vault_record", id)?;
         tx.commit().map_err(sql_failed)?;
-        Ok((
-            entity,
-            conflict,
-            ResolutionGuard {
-                cursor,
-                local_revision,
-                lifecycle,
-            },
-        ))
+        Ok((entity, conflict, guard))
     }
+    pub(crate) fn observation_resolution(
+        &self,
+        id: &str,
+        selected: &nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+        selected_operation: &[u8],
+    ) -> Result<ObservationResolution, Error> {
+        self.read(|connection| {
+            if selected_current(connection, selected)?.body != selected_operation {
+                return Err(Error::SelectionChanged);
+            }
+            let mut target = entity(connection, "repository_state", id)?.ok_or(Error::Invalid)?;
+            if !target.conflicted { return Err(Error::Busy); }
+            let dispatched: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM v3_outbox WHERE kind='repository_state' AND entity_id=?1 AND dispatched=1)",
+                [id], |r| r.get(0),
+            ).map_err(sql_failed)?;
+            if dispatched { return Err(Error::Busy); }
+            let (committed, conflict, guard) = resolution_evidence(connection, "repository_state", id)?;
+            target.body = committed;
+            let pending = target.pending_id.as_ref().map(|id| {
+                connection.query_row("SELECT body FROM v3_outbox WHERE id=?1 AND dispatched=0", [id], |r| r.get(0)).map_err(sql_failed)
+            }).transpose()?;
+            if conflict.is_none() && pending.is_none() { return Err(Error::Invalid); }
+            Ok(ObservationResolution { target, conflict, pending, guard })
+        })
+    }
+
     pub fn record_page(&self, after: &str) -> Result<(Vec<RecordEntry>, u64, u64), Error> {
         let mut connection = self.connection()?;
         let tx = transaction(&mut connection, TransactionBehavior::Deferred)?;
@@ -350,6 +319,84 @@ fn read_catalog_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, Enti
             conflicted: row.get(4)?,
             pending_id: row.get(5)?,
             next_base: row.get(6)?,
+        },
+    ))
+}
+
+/// Shared resolution read: exact committed bytes and complete scoped receipt
+/// witnesses from one transaction. Only the latest original crosses IPC; all
+/// witnesses contribute to the existing lifecycle rule without loading a second
+/// complete ciphertext set into memory.
+fn resolution_evidence(
+    connection: &Connection,
+    kind: &str,
+    id: &str,
+) -> Result<(Vec<u8>, Option<RawRow>, ResolutionGuard), Error> {
+    let (cursor, local_revision, known): (u64, u64, u64) = connection
+        .query_row(
+            "SELECT cursor,local_revision,known_committed_seq FROM v3_meta WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(sql_failed)?;
+    let body: Vec<u8> = connection
+        .query_row(
+            "SELECT body FROM v3_entities WHERE kind=?1 AND id=?2",
+            params![kind, id],
+            |r| r.get(0),
+        )
+        .map_err(sql_failed)?;
+    let committed = crate::codec::versioned(&body)?;
+    if committed.operation.entity_kind.as_str() != kind || committed.operation.entity_id != id {
+        return Err(Error::Invalid);
+    }
+    let mut sequences = Vec::new();
+    let mut latest: Option<RawRow> = None;
+    let mut query = connection
+        .prepare("SELECT body,result FROM v3_conflicts WHERE kind=?1 AND entity_id=?2 LIMIT ?3")
+        .map_err(sql_failed)?;
+    let mut rows = query
+        .query(params![
+            kind,
+            id,
+            nddev_device_sync_domain::sync::MAX_OPERATIONS + 1
+        ])
+        .map_err(sql_failed)?;
+    while let Some(row) = rows.next().map_err(sql_failed)? {
+        let request: Vec<u8> = row.get(0).map_err(sql_failed)?;
+        let result: Vec<u8> = row.get(1).map_err(sql_failed)?;
+        let (operation, receipt) = crate::codec::original_receipt(&request, &result, 409)?;
+        if operation.operation.entity_kind != committed.operation.entity_kind
+            || operation.operation.entity_id != id
+        {
+            return Err(Error::Invalid);
+        }
+        sequences.push(receipt.server_seq);
+        if latest
+            .as_ref()
+            .is_none_or(|old| old.sequence < receipt.server_seq)
+        {
+            latest = Some(RawRow {
+                body: request,
+                result,
+                status: 409,
+                sequence: receipt.server_seq,
+                legacy_resolved: 0,
+            });
+        }
+    }
+    let lifecycle = nddev_device_sync_domain::sync::history::resolution_lifecycle(
+        committed.lifecycle(),
+        &sequences,
+        cursor.max(known),
+    )?;
+    Ok((
+        body,
+        latest,
+        ResolutionGuard {
+            cursor,
+            local_revision,
+            lifecycle,
         },
     ))
 }

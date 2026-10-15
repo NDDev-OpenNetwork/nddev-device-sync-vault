@@ -1801,4 +1801,5 @@ pub(crate) mod history_replica;
 mod repository;
 pub use repository::{
     RepositoryCatalogCursor, RepositoryCatalogPage, RepositoryPublication, RepositoryRead,
+    RepositoryResolution, RetainedRepositoryObservation,
 };

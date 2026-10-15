@@ -7,6 +7,7 @@ use nddev_device_sync_domain::repositories::catalog::observations::{
     Candidate, ObservationContext, ObservationKey, ObservedTarget, PublicationDecision,
     RepositoryObservation, TargetVersion,
 };
+use nddev_device_sync_domain::sync::history::VersionedOperation;
 use std::collections::BTreeMap;
 
 pub(super) struct SourceGuard {
@@ -67,14 +68,77 @@ pub struct RepositoryCatalogPage {
     pub local_revision: u64,
 }
 
-fn decode_catalog_entity(
+/// Authenticated retained observation, without invented local pre-dispatch state.
+/// It is Rust-only metadata; the original encrypted bytes stay in the journal.
+pub struct RetainedRepositoryObservation {
+    operation: VersionedOperation,
+    observation: RepositoryObservation,
+    wire_bytes: usize,
+    observed_at_ms: u64,
+}
+impl RetainedRepositoryObservation {
+    pub fn operation(&self) -> &VersionedOperation {
+        &self.operation
+    }
+    pub fn observation(&self) -> &RepositoryObservation {
+        &self.observation
+    }
+    pub fn wire_bytes(&self) -> usize {
+        self.wire_bytes
+    }
+    pub fn observed_at_ms(&self) -> u64 {
+        self.observed_at_ms
+    }
+}
+
+/// One complete local resolution snapshot. It records evidence, not permission
+/// to remove a conflict. Its original source read remains owned across provider I/O.
+pub struct RepositoryResolution {
+    read: Arc<RepositoryRead>,
+    current: ObservedTarget,
+    conflict: Option<(
+        RetainedRepositoryObservation,
+        nddev_device_sync_domain::sync::Receipt,
+    )>,
+    pending: Option<RetainedRepositoryObservation>,
+    guard: crate::journal::ResolutionGuard,
+}
+impl RepositoryResolution {
+    pub fn current(&self) -> &ObservedTarget {
+        &self.current
+    }
+    pub fn conflict(
+        &self,
+    ) -> Option<(
+        &RetainedRepositoryObservation,
+        &nddev_device_sync_domain::sync::Receipt,
+    )> {
+        self.conflict
+            .as_ref()
+            .map(|(original, receipt)| (original, receipt))
+    }
+    /// Actual undispatched local intent; a server receipt is never fabricated.
+    pub fn pending(&self) -> Option<&RetainedRepositoryObservation> {
+        self.pending.as_ref()
+    }
+    pub fn selection(&self) -> &CredentialSelection {
+        &self.read.source.selection
+    }
+    pub fn local_revision(&self) -> u64 {
+        self.guard.local_revision
+    }
+    pub fn resolution_lifecycle(&self) -> nddev_device_sync_domain::sync::history::Lifecycle {
+        self.guard.lifecycle
+    }
+}
+
+fn decode_retained(
     scope: &Scope,
     key: &VaultKey,
     expected_id: &str,
-    entity: crate::journal::Entity,
-    history_cursor: u64,
-) -> Result<(ObservedTarget, u64), Error> {
-    let operation = codec::versioned(&entity.body)?;
+    body: &[u8],
+) -> Result<RetainedRepositoryObservation, Error> {
+    let operation = codec::versioned(body)?;
     if operation.operation.entity_kind != EntityKind::RepositoryState
         || operation.operation.entity_id != expected_id
     {
@@ -92,6 +156,21 @@ fn decode_catalog_entity(
     let State::Repository { observation } = snapshot.data else {
         return Err(Error::Invalid);
     };
+    Ok(RetainedRepositoryObservation {
+        operation,
+        observation,
+        wire_bytes: body.len(),
+        observed_at_ms: snapshot.observed_at_ms,
+    })
+}
+fn decode_catalog_entity(
+    scope: &Scope,
+    key: &VaultKey,
+    expected_id: &str,
+    entity: crate::journal::Entity,
+    history_cursor: u64,
+) -> Result<(ObservedTarget, u64), Error> {
+    let retained = decode_retained(scope, key, expected_id, &entity.body)?;
     let version = TargetVersion {
         revision: entity.revision,
         next_base: entity.next_base,
@@ -101,12 +180,12 @@ fn decode_catalog_entity(
     version.validate().map_err(|_| Error::Invalid)?;
     Ok((
         ObservedTarget {
-            key: observation.key(),
+            key: retained.observation.key(),
             version,
-            value: Some(observation),
+            value: Some(retained.observation),
             history_cursor,
         },
-        snapshot.observed_at_ms,
+        retained.observed_at_ms,
     ))
 }
 
@@ -336,6 +415,62 @@ impl VaultClient {
             .map_err(identity_failure);
         read.source.check()?;
         result
+    }
+
+    /// Capture an existing conflict family before a fresh provider read. Dispatched
+    /// originals (including unknown outcomes) are refused rather than replaced.
+    pub async fn repository_resolution(
+        &self,
+        read: Arc<RepositoryRead>,
+        expected: &ObservationKey,
+    ) -> Result<RepositoryResolution, Error> {
+        let _permit = self.admitted()?;
+        expected.validate().map_err(|_| Error::Invalid)?;
+        self.validate_repository_read(&read).await?;
+        let key = self.key().await?.ok_or(Error::Locked)?;
+        let id = expected.entity_id();
+        let raw = match self
+            .journal
+            .call(crate::storage::Command::ObservationResolution {
+                id: id.clone(),
+                selected: read.source.selection.clone(),
+                selected_operation: read.source.operation.clone(),
+            })
+            .await?
+        {
+            crate::storage::Reply::ObservationResolution(value) => value,
+            _ => return Err(Error::Invalid),
+        };
+        let (current, _) =
+            decode_catalog_entity(&self.scope, &key, &id, raw.target, raw.guard.cursor)?;
+        if read.targets.get(&id) != Some(&current.version) {
+            return Err(Error::Busy);
+        }
+        let conflict = raw
+            .conflict
+            .map(|row| {
+                let (_, receipt) = row.decode()?;
+                let original = decode_retained(&self.scope, &key, &id, &row.body)?;
+                Ok::<_, Error>((original, receipt))
+            })
+            .transpose()?;
+        let pending = raw
+            .pending
+            .map(|body| decode_retained(&self.scope, &key, &id, &body))
+            .transpose()?;
+        if pending.as_ref().is_some_and(|value| {
+            current.version.pending_id.as_deref() != Some(value.operation.operation.id.as_str())
+        }) {
+            return Err(Error::Invalid);
+        }
+        self.validate_repository_read(&read).await?;
+        Ok(RepositoryResolution {
+            read,
+            current,
+            conflict,
+            pending,
+            guard: raw.guard,
+        })
     }
 
     /// Read previous saved scope evidence under the original pre-provider guard.

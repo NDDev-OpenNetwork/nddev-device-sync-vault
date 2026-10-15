@@ -115,3 +115,16 @@ requests that preference at startup and reports the observed result; it never
 claims protection from explicit site-data removal. Admission allows at most
 four concurrent storage calls, with a 500 ms wait for the connection; local
 acknowledgement is a completed storage transaction, not a cloud acknowledgement.
+
+The owning Cargo root selects the canonical Core Git source for both direct and
+transitive legacy Core URLs. Cargo ignores patches declared by dependencies:
+consuming application roots must select the same source and verify one Core
+package graph until their immutable transitive manifests have been adopted.
+
+Repository conflict capture retains the actual committed observation, latest
+conflict original/receipt and any undispatched local intent after reopen. All
+scoped receipts contribute to the existing resolution lifecycle; cursor values
+are not substituted for witnesses. Dispatched families are refused until their
+real outcome is known. Captured evidence does not itself resolve or delete a
+conflict; fresh provider input and the confirmed resolution transaction are
+separate requirements.

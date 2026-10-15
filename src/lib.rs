@@ -4,7 +4,8 @@ mod codec;
 mod key_discovery;
 pub use client::{
     CheckpointStage, InboxProgress, RepositoryCatalogCursor, RepositoryCatalogPage,
-    RepositoryPublication, RepositoryRead, VaultClient,
+    RepositoryPublication, RepositoryRead, RepositoryResolution, RetainedRepositoryObservation,
+    VaultClient,
 };
 use nddev_device_sync_accounts::sync3_wire;
 pub mod view;

@@ -102,6 +102,11 @@ pub(crate) enum Command {
     ObservationTarget {
         id: String,
     },
+    ObservationResolution {
+        id: String,
+        selected: nddev_device_sync_domain::repositories::catalog::CredentialSelection,
+        selected_operation: Vec<u8>,
+    },
     RepositoryPage {
         after: String,
     },
@@ -180,6 +185,7 @@ impl Command {
             Self::Pending => "vault.storage.claim",
             Self::Cursor => "vault.storage.cursor",
             Self::ObservationTarget { .. } => "vault.storage.observation_target",
+            Self::ObservationResolution { .. } => "vault.storage.observation_resolution",
             Self::RepositoryPage { .. } => "vault.storage.repository_page",
             Self::RepositoryOwners { .. } => "vault.storage.repository_owners",
             Self::ObservationBaselines { .. } => "vault.storage.observation_baselines",
@@ -226,6 +232,7 @@ pub(crate) enum Reply {
     Cursor(u64),
     ObservationBaselines(ObservationBaselines),
     ObservationTarget(ObservationTarget),
+    ObservationResolution(crate::journal::ObservationResolution),
     CatalogRows(crate::journal::CatalogRows),
     Entity(Option<Entity>),
     Records(Vec<RecordEntry>, u64, u64),
@@ -239,6 +246,15 @@ pub(crate) enum Reply {
 
 pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Error> {
     Ok(match command {
+        Command::ObservationResolution {
+            id,
+            selected,
+            selected_operation,
+        } => Reply::ObservationResolution(journal.observation_resolution(
+            &id,
+            &selected,
+            &selected_operation,
+        )?),
         Command::RepositoryPage { after } => Reply::CatalogRows(journal.repository_page(&after)?),
         Command::RepositoryOwners { ids, expected } => {
             Reply::CatalogRows(journal.repository_owners(&ids, expected)?)

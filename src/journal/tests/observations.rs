@@ -581,3 +581,243 @@ fn partial_scope_summary_retains_encrypted_completion_evidence_after_reopen() {
         .unwrap();
     assert_eq!(summary.pending_id.as_deref(), Some("v3:42:scope-summary"));
 }
+
+fn retained_row(
+    key: &VaultKey,
+    selected: &CredentialSelection,
+    id: &str,
+    seq: u64,
+    conflict: bool,
+) -> RawRow {
+    let body = observed(key, selected, id);
+    let operation_id = crate::codec::versioned(&body).unwrap().operation.id;
+    let result = if conflict {
+        wire::Sync::Conflict(wire::SyncConflict {
+            operation_id,
+            outcome: wire::SyncConflictOutcome::Conflict,
+            base_revision: 0,
+            current_revision: 1,
+            resolution_state: wire::ResolutionState::Unresolved,
+            server_seq: seq as i64,
+        })
+    } else {
+        super::result(&operation_id, seq as i64)
+    };
+    RawRow {
+        body,
+        result: serde_json::to_vec(&result).unwrap(),
+        status: if conflict { 409 } else { 201 },
+        sequence: seq,
+        legacy_resolved: 0,
+    }
+}
+
+#[test]
+fn actual_conflict_capture_reopens_exact_originals_and_preserves_pending_ancestry() {
+    let (owned, journal, key, selected, before) = setup();
+    let pending = observed(&key, &selected, "local-intent");
+    journal
+        .enqueue_observation(
+            pending.clone(),
+            0,
+            None,
+            &selected,
+            &before.selected_operation,
+            &guard(&key, &before),
+        )
+        .unwrap();
+    let committed = retained_row(&key, &selected, "committed", 43, false);
+    let conflict = retained_row(&key, &selected, "conflicted", 44, true);
+    let committed_bytes = committed.body.clone();
+    let conflict_bytes = conflict.body.clone();
+    let conflict_result = conflict.result.clone();
+    let checkpoint = journal
+        .begin_checkpoint(&"c".repeat(64), &key.id(), 44, 2, 0)
+        .unwrap();
+    journal
+        .stage_base(&checkpoint, 44, 2, &[committed, conflict], 44, false)
+        .unwrap();
+    journal
+        .stage_delta(&checkpoint, 44, &[], 44, false)
+        .unwrap();
+    journal.install_checkpoint(&checkpoint).unwrap();
+    let reopened = Journal::open(owned.0.join("replica.db")).unwrap();
+    let counts = reopened.stats().unwrap();
+    let restored = reopened
+        .observation_resolution("github:repo:9", &selected, &before.selected_operation)
+        .unwrap();
+    assert_eq!(restored.target.body, committed_bytes);
+    assert_eq!(restored.target.revision, 1);
+    assert_eq!(restored.target.next_base, 0); // A real unsent original behind the caught-up head.
+    assert_eq!(
+        restored.target.pending_id.as_deref(),
+        Some("v3:42:local-intent")
+    );
+    assert_eq!(restored.pending.as_deref(), Some(pending.as_slice()));
+    assert_eq!(restored.guard.cursor, 44);
+    assert_eq!(restored.guard.local_revision, counts.4);
+    assert_eq!(restored.guard.lifecycle.resolved_through_seq, 44);
+    let retained = restored.conflict.unwrap();
+    assert_eq!(retained.body, conflict_bytes);
+    assert_eq!(retained.result, conflict_result);
+    let (original, receipt) = retained.decode().unwrap();
+    assert_eq!(original.operation.base_revision, 0);
+    assert_eq!(receipt.server_seq, 44);
+    let plaintext = key.decrypt_versioned(&scope(), &original).unwrap();
+    let snapshot: Snapshot = serde_json::from_slice(&plaintext).unwrap();
+    snapshot
+        .validate(
+            &original.operation.device,
+            EntityKind::RepositoryState,
+            "github:repo:9",
+        )
+        .unwrap();
+    assert_eq!(reopened.stats().unwrap(), counts); // Read-only capture.
+    reopened.pending().unwrap();
+    assert!(matches!(
+        reopened.observation_resolution("github:repo:9", &selected, &before.selected_operation),
+        Err(Error::Busy)
+    ));
+    let new_selection = CredentialSelection::new("credential".into(), 1, None).unwrap();
+    assert!(matches!(
+        reopened.observation_resolution(
+            "github:repo:9",
+            &new_selection,
+            &before.selected_operation
+        ),
+        Err(Error::SelectionChanged)
+    ));
+}
+
+#[test]
+fn resolution_capture_rejects_a_conflict_original_bound_to_another_entity() {
+    let (owned, journal, key, selected, before) = setup();
+    let committed = retained_row(&key, &selected, "committed", 43, false);
+    let conflict = retained_row(&key, &selected, "conflicted", 44, true);
+    let checkpoint = journal
+        .begin_checkpoint(&"c".repeat(64), &key.id(), 44, 2, 0)
+        .unwrap();
+    journal
+        .stage_base(&checkpoint, 44, 2, &[committed, conflict], 44, false)
+        .unwrap();
+    journal
+        .stage_delta(&checkpoint, 44, &[], 44, false)
+        .unwrap();
+    journal.install_checkpoint(&checkpoint).unwrap();
+    let other = observed_repository(&key, &selected, "conflicted", 10);
+    let connection = Connection::open(owned.0.join("replica.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE v3_conflicts SET body=?1 WHERE entity_id='github:repo:9'",
+            [other],
+        )
+        .unwrap();
+    let before_read = journal.stats().unwrap();
+    assert!(matches!(
+        journal.observation_resolution("github:repo:9", &selected, &before.selected_operation),
+        Err(Error::Invalid)
+    ));
+    assert_eq!(journal.stats().unwrap(), before_read);
+}
+
+#[test]
+fn resolution_capture_checks_all_witnesses_and_chooses_latest_by_sequence() {
+    let (owned, journal, key, selected, before) = setup();
+    let head = retained_row(&key, &selected, "head", 43, false);
+    let older = retained_row(&key, &selected, "z-older", 44, true);
+    let newer = retained_row(&key, &selected, "a-newer", 45, true);
+    let latest_body = newer.body.clone();
+    let checkpoint = journal
+        .begin_checkpoint(&"c".repeat(64), &key.id(), 45, 3, 0)
+        .unwrap();
+    journal
+        .stage_base(&checkpoint, 45, 3, &[head, older, newer], 45, false)
+        .unwrap();
+    journal
+        .stage_delta(&checkpoint, 45, &[], 45, false)
+        .unwrap();
+    journal.install_checkpoint(&checkpoint).unwrap();
+    let capture = journal
+        .observation_resolution("github:repo:9", &selected, &before.selected_operation)
+        .unwrap();
+    assert_eq!(capture.conflict.unwrap().body, latest_body);
+    assert_eq!(capture.guard.lifecycle.resolved_through_seq, 45);
+    let connection = Connection::open(owned.0.join("replica.db")).unwrap();
+    connection.execute("UPDATE v3_conflicts SET result=CAST(json_set(CAST(result AS TEXT),'$.server_seq',45) AS BLOB) WHERE json_extract(CAST(result AS TEXT),'$.server_seq')=44", []).unwrap();
+    assert!(matches!(
+        journal.observation_resolution("github:repo:9", &selected, &before.selected_operation),
+        Err(Error::Invalid)
+    ));
+}
+
+#[test]
+fn blocked_only_capture_never_fabricates_a_conflict_receipt_or_raises_the_lifecycle() {
+    let (owned, journal, key, selected, before) = setup();
+    let pending = observed(&key, &selected, "remaining-local-intent");
+    journal
+        .enqueue_observation(
+            pending.clone(),
+            0,
+            None,
+            &selected,
+            &before.selected_operation,
+            &guard(&key, &before),
+        )
+        .unwrap();
+    // Structurally valid retained state after a peer resolved the known family.
+    // This exercises the read adapter, not a server resolution acceptance path.
+    let template = crate::codec::versioned(&observed(&key, &selected, "template")).unwrap();
+    let plain = key.decrypt_versioned(&scope(), &template).unwrap();
+    let mut operation = template.operation;
+    operation.id = "peer-resolver".into();
+    operation.idempotency_key = "peer-resolver".into();
+    operation.base_revision = 1;
+    let mut resolver = VersionedOperation::qualify(
+        operation,
+        44,
+        Lifecycle {
+            resolved_through_seq: 44,
+        },
+    )
+    .unwrap();
+    resolver.operation.payload = key.encrypt_versioned(&scope(), &resolver, &plain).unwrap();
+    let result = wire::Sync::Applied(wire::SyncApplied {
+        operation_id: resolver.operation.id.clone(),
+        outcome: wire::SyncAppliedOutcome::Applied,
+        revision: 2,
+        server_seq: 45,
+    });
+    let row = RawRow {
+        body: crate::codec::versioned_body(&resolver).unwrap(),
+        result: serde_json::to_vec(&result).unwrap(),
+        status: 201,
+        sequence: 45,
+        legacy_resolved: 0,
+    };
+    let checkpoint = journal
+        .begin_checkpoint(&"c".repeat(64), &key.id(), 45, 1, 0)
+        .unwrap();
+    journal
+        .stage_base(&checkpoint, 45, 1, &[row], 45, false)
+        .unwrap();
+    journal
+        .stage_delta(&checkpoint, 45, &[], 45, false)
+        .unwrap();
+    journal.install_checkpoint(&checkpoint).unwrap();
+    let connection = Connection::open(owned.0.join("replica.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE v3_outbox SET state='conflict' WHERE id='v3:42:remaining-local-intent'",
+            [],
+        )
+        .unwrap();
+    let capture = journal
+        .observation_resolution("github:repo:9", &selected, &before.selected_operation)
+        .unwrap();
+    assert!(capture.conflict.is_none());
+    assert_eq!(capture.pending.as_deref(), Some(pending.as_slice()));
+    assert_eq!(capture.guard.cursor, 45);
+    assert_eq!(capture.guard.lifecycle.resolved_through_seq, 44);
+    assert_eq!(capture.target.revision, 2);
+    assert!(capture.target.conflicted);
+}
