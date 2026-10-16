@@ -150,9 +150,8 @@ impl Journal {
             if let Some(resolution) = observation.resolution {
                 if expected_cursor != Some(resolution.cursor)
                     || resolution.lifecycle.resolved_through_seq > resolution.cursor
-                    || writer.is_none_or(|writer| {
-                        writer.expected_local_revision != Some(resolution.local_revision)
-                    })
+                    || resolution.repository_fingerprint.is_none()
+                    || writer.is_none_or(|writer| writer.expected_local_revision.is_some())
                     || !matches!(
                         versioned.version,
                         nddev_device_sync_domain::sync::history::OperationVersion::V3 { .. }
@@ -162,7 +161,7 @@ impl Journal {
                     return Err(Error::Invalid);
                 }
                 let (_, _, current) = reads::resolution_evidence(&tx, kind, &operation.entity_id)?;
-                if current != *resolution {
+                if !resolution.repository_matches(&current) {
                     return Err(Error::Busy);
                 }
             }
@@ -196,12 +195,18 @@ impl Journal {
                     r.get(0)
                 })
                 .map_err(sql_failed)?;
-            if actual != expected
-                || !(kind == "vault_record"
-                    || kind == "repository_state"
-                        && selected
-                            .as_ref()
-                            .is_some_and(|guard| guard.resolution.is_some()))
+            let scoped = selected
+                .as_ref()
+                .is_some_and(|guard| guard.resolution.is_some());
+            if (if scoped {
+                actual < expected
+            } else {
+                actual != expected
+            }) || !(kind == "vault_record"
+                || kind == "repository_state"
+                    && selected
+                        .as_ref()
+                        .is_some_and(|guard| guard.resolution.is_some()))
                 || !entity.as_ref().is_some_and(|e| e.conflicted)
             {
                 return Err(Error::Busy);

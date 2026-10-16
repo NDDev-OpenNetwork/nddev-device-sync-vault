@@ -127,9 +127,9 @@ pub(crate) enum Command {
         selected_operation: Vec<u8>,
         writer: crate::journal::WriterEnqueueGuard,
     },
-    // Distinct command: an older worker must reject a resolver, never ignore
-    // added fields and treat it as an ordinary observation enqueue.
-    EnqueueResolvedObservation {
+    // Distinct command: older workers must reject the scoped fingerprint guard,
+    // never ignore it and accept a newly weakened global revision comparison.
+    EnqueueRepositoryResolution {
         body: Vec<u8>,
         expected_revision: u64,
         expected_pending: Option<String>,
@@ -201,7 +201,7 @@ impl Command {
             Self::RepositoryOwners { .. } => "vault.storage.repository_owners",
             Self::ObservationBaselines { .. } => "vault.storage.observation_baselines",
             Self::EnqueueObservedWriter { .. } => "vault.storage.enqueue_observation",
-            Self::EnqueueResolvedObservation { .. } => "vault.storage.resolve_observation",
+            Self::EnqueueRepositoryResolution { .. } => "vault.storage.resolve_observation",
             Self::Entity { .. } => "vault.storage.entity",
             Self::Records { .. } => "vault.storage.records",
             Self::Resolution { .. } => "vault.storage.resolution",
@@ -258,7 +258,7 @@ pub(crate) enum Reply {
 
 pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Error> {
     Ok(match command {
-        Command::EnqueueResolvedObservation {
+        Command::EnqueueRepositoryResolution {
             body,
             expected_revision,
             expected_pending,

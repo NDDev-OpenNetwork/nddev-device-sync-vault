@@ -357,8 +357,11 @@ pub(super) fn resolution_evidence(
     }
     let mut sequences = Vec::new();
     let mut latest: Option<RawRow> = None;
+    let mut fingerprint = (kind == "repository_state")
+        .then(|| resolution::begin(connection, kind, id, &body))
+        .transpose()?;
     let mut query = connection
-        .prepare("SELECT body,result FROM v3_conflicts WHERE kind=?1 AND entity_id=?2 LIMIT ?3")
+        .prepare("SELECT id,body,result FROM v3_conflicts WHERE kind=?1 AND entity_id=?2 ORDER BY id LIMIT ?3")
         .map_err(sql_failed)?;
     let mut rows = query
         .query(params![
@@ -368,8 +371,8 @@ pub(super) fn resolution_evidence(
         ])
         .map_err(sql_failed)?;
     while let Some(row) = rows.next().map_err(sql_failed)? {
-        let request: Vec<u8> = row.get(0).map_err(sql_failed)?;
-        let result: Vec<u8> = row.get(1).map_err(sql_failed)?;
+        let request: Vec<u8> = row.get(1).map_err(sql_failed)?;
+        let result: Vec<u8> = row.get(2).map_err(sql_failed)?;
         let (operation, receipt) = crate::codec::original_receipt(&request, &result, 409)?;
         if operation.operation.entity_kind != committed.operation.entity_kind
             || operation.operation.entity_id != id
@@ -377,6 +380,15 @@ pub(super) fn resolution_evidence(
             return Err(Error::Invalid);
         }
         sequences.push(receipt.server_seq);
+        if let Some(hash) = &mut fingerprint {
+            resolution::field(hash, b"conflict");
+            resolution::field(
+                hash,
+                row.get::<_, String>(0).map_err(sql_failed)?.as_bytes(),
+            );
+            resolution::field(hash, &request);
+            resolution::field(hash, &result);
+        }
         if latest
             .as_ref()
             .is_none_or(|old| old.sequence < receipt.server_seq)
@@ -402,6 +414,8 @@ pub(super) fn resolution_evidence(
             cursor,
             local_revision,
             lifecycle,
+            repository_fingerprint: fingerprint
+                .map(|hash| hash.finish().as_ref().try_into().expect("SHA256 length")),
         },
     ))
 }

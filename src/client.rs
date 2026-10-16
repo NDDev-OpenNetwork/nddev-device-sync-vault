@@ -327,9 +327,12 @@ impl VaultClient {
             .as_ref()
             .and_then(|expected| expected.resolution.as_ref());
         if resolution.is_some_and(|guard| {
-            guard.cursor != capture.writer.cursor
-                || guard.local_revision != capture.writer.local_revision
-                || guard.lifecycle.resolved_through_seq > guard.cursor
+            (if guard.repository_fingerprint.is_some() {
+                kind != EntityKind::RepositoryState || guard.cursor > capture.writer.cursor
+            } else {
+                guard.cursor != capture.writer.cursor
+                    || guard.local_revision != capture.writer.local_revision
+            }) || guard.lifecycle.resolved_through_seq > guard.cursor
         }) {
             return Err(Error::Busy);
         }
@@ -422,14 +425,16 @@ impl VaultClient {
             facts: capture.writer.facts,
             actual_key_id: key.id(),
             basis_seq,
-            expected_local_revision: resolution.map(|guard| guard.local_revision),
+            expected_local_revision: resolution
+                .filter(|guard| guard.repository_fingerprint.is_none())
+                .map(|guard| guard.local_revision),
         };
         let command = match (
             expected.as_ref().and_then(|e| e.observation.as_ref()),
             resolution,
         ) {
             (Some(source), Some(resolution)) => {
-                crate::storage::Command::EnqueueResolvedObservation {
+                crate::storage::Command::EnqueueRepositoryResolution {
                     body: bytes,
                     expected_revision: revision,
                     expected_pending: pending,
