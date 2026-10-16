@@ -65,6 +65,12 @@ observed cursor/revision and original timestamps, not current provider freshness
 
 Run `just check`. The ignored native acceptance requires an explicitly started isolated PostgreSQL/Mailpit fixture and unlocked native credential service; set `NDS_FIXTURE_RECEIPT` and run `just native-acceptance`. Host checks do not prove another platform's secure-store or UI behavior.
 
+`just catalog-acceptance` uses a fresh server fixture started with `--fixture-sync3`.
+It sends generated facts for 1024 repositories through real HTTP/PostgreSQL,
+checks unchanged and changed observations in a second SQLite replica, then
+reopens that replica with the server offline. Both replicas share one enrollment;
+this does not qualify GitHub access or 32 independently enrolled devices.
+
 Vault record lists use 50-entity keyset pages with explicit continuation, including
 pages containing only tombstones. Records expose their observed revision/cursor
 and the latest conflicting edit's metadata. Native secret use rejects conflicts;
