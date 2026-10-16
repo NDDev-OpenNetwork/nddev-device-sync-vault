@@ -1065,7 +1065,8 @@ impl VaultClient {
             }
             Some((kind.to_owned(), id.to_owned()))
         };
-        let mut entries = self.journal.state_page(cursor).await?;
+        let page = self.journal.state_page(cursor).await?;
+        let mut entries = page.entries;
         let has_more = entries.len() > 50;
         entries.truncate(50);
         let next_after = entries
@@ -1118,6 +1119,7 @@ impl VaultClient {
                 expires_at_ms: 0,
                 error_class: String::new(),
                 revision: entity.revision,
+                pending_id: entity.pending_id,
                 conflicted: entity.conflicted,
             };
             match snapshot.data {
@@ -1165,6 +1167,8 @@ impl VaultClient {
             items.push(value);
         }
         Ok(StatePage {
+            observed_seq: page.cursor,
+            local_revision: page.local_revision,
             items,
             next_after,
             has_more,

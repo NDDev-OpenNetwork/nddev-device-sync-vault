@@ -60,10 +60,13 @@ pub struct StateView {
     pub expires_at_ms: u64,
     pub error_class: String,
     pub revision: u64,
+    pub pending_id: Option<String>,
     pub conflicted: bool,
 }
 #[derive(Clone)]
 pub struct StatePage {
+    pub observed_seq: u64,
+    pub local_revision: u64,
     pub items: Vec<StateView>,
     pub next_after: String,
     pub has_more: bool,
