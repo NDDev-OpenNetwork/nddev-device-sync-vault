@@ -26,6 +26,13 @@ the core upload-capacity block and presents it independently of the current
 read result. Successful reads clear read errors, not upload eligibility; real
 read failures remain typed and observable. No second scheduler lives in Vault.
 
+`probe_capacity` executes Core's bounded one-original check through the same
+signed append and durable acknowledgement/Unknown path. Its distinct storage
+claim cannot mark the other roots dispatched. Authenticated history metadata is
+only a trigger for that check, never proof that capacity exists. A completed
+probe outcome is returned before unrelated view/inbox reads can obscure it;
+normal upload eligibility remains owned by Core and the shared caller's fence.
+
 `native_secret_at` and `ensure_record_current` use the same protected key,
 admission and journal/decode path as `native_secret`. The canonical Core
 `CredentialSelection` binds the record ref, committed revision and exact current

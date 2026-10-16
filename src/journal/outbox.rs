@@ -4,20 +4,23 @@ impl Journal {
     /// Claim immutable roots before any network I/O. Repeated claims return the
     /// same bytes; successors cannot be sent until the predecessor is applied.
     pub fn pending(&self) -> Result<Vec<Pending>, Error> {
+        self.claim_pending(nddev_device_sync_application::replica::MAX_UPLOADS)
+    }
+    pub(crate) fn claim_one(&self) -> Result<Vec<Pending>, Error> {
+        self.claim_pending(1)
+    }
+    fn claim_pending(&self, limit: usize) -> Result<Vec<Pending>, Error> {
         let mut connection = self.connection()?;
         let tx = transaction(&mut connection, TransactionBehavior::Immediate)?;
         let entries = {
             let mut query=tx.prepare("SELECT id,body FROM v3_outbox WHERE state='pending' AND predecessor IS NULL AND terminal_unknown_reason IS NULL ORDER BY rowid LIMIT ?1").map_err(sql_failed)?;
             query
-                .query_map(
-                    [nddev_device_sync_application::replica::MAX_UPLOADS as u32],
-                    |r| {
-                        Ok(Pending {
-                            id: r.get(0)?,
-                            body: r.get(1)?,
-                        })
-                    },
-                )
+                .query_map([limit as u32], |r| {
+                    Ok(Pending {
+                        id: r.get(0)?,
+                        body: r.get(1)?,
+                    })
+                })
                 .map_err(sql_failed)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(sql_failed)?

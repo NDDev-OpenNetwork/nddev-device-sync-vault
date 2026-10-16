@@ -205,6 +205,7 @@ impl ReplicaPort for Replica<'_> {
             return Ok(Preparation::ReadBudgetExhausted);
         }
         let mut observed = None;
+        let mut history = None;
         let hint = match mode {
             ReadMode::Legacy => {
                 let reply = self
@@ -239,6 +240,8 @@ impl ReplicaPort for Replica<'_> {
                     .await?;
                 match Self::expired(&reply)? {
                     Some(ReadOutcome::Expired(h)) => {
+                        h.validate()?;
+                        history = Some(h);
                         observed = Some(h.head);
                         if !budget.take_read() {
                             return Ok(Preparation::ReadBudgetExhausted);
@@ -263,6 +266,12 @@ impl ReplicaPort for Replica<'_> {
                         let p: crate::sync3_wire::SyncDeltaPage =
                             serde_json::from_slice(&reply.body).map_err(|_| Error::Invalid)?;
                         observed = Some(p.head_seq.try_into().map_err(|_| Error::Invalid)?);
+                        let floor = p.floor_seq.try_into().map_err(|_| Error::Invalid)?;
+                        history = Some(HistoryVersion {
+                            head: observed.ok_or(Error::Invalid)?,
+                            floor,
+                            base: floor,
+                        });
                         crate::key_discovery::history_hint(&reply.body, 0)?
                     }
                 }
@@ -303,6 +312,9 @@ impl ReplicaPort for Replica<'_> {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(key.id());
         *self.key_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(key.id());
+        if let Some(history) = history {
+            self.client.record_history(history)?;
+        }
         Ok(Preparation::Ready(PreparedContext {
             key_id: key.id(),
             observed_basis: observed,
@@ -352,6 +364,13 @@ impl ReplicaPort for Replica<'_> {
     async fn claim(&self) -> Result<Vec<Self::Pending>, Error> {
         self.validate().await?;
         self.client.journal.pending().await
+    }
+    async fn claim_one(&self) -> Result<Option<Self::Pending>, Error> {
+        self.validate().await?;
+        match self.client.journal.call(Command::ClaimOne).await? {
+            Reply::Pending(mut rows) if rows.len() <= 1 => Ok(rows.pop()),
+            _ => Err(Error::Invalid),
+        }
     }
     async fn append_outcome(
         &self,
@@ -490,6 +509,11 @@ impl ReplicaPort for Replica<'_> {
         match page {
             PageData::Legacy(p, r) => self.client.journal.ingest(p, r).await,
             PageData::Versioned(p) => {
+                let history = HistoryVersion {
+                    head: p.head,
+                    floor: p.floor,
+                    base: p.floor,
+                };
                 self.client
                     .journal
                     .call(Command::IngestOriginal {
@@ -501,6 +525,8 @@ impl ReplicaPort for Replica<'_> {
                         more: p.more,
                     })
                     .await?;
+                self.validate().await?;
+                self.client.record_history(history)?;
                 Ok(())
             }
         }

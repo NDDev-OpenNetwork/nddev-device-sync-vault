@@ -59,6 +59,8 @@ impl ReadRecord {
 pub struct InboxProgress {
     pub view: VaultView,
     pub inbox_at_head: bool,
+    /// Actual Core/store freshness decision, never inferred from the UI cache.
+    pub caught_up: bool,
 }
 pub struct VaultClient {
     identity: Arc<IdentityClient>,
@@ -69,6 +71,7 @@ pub struct VaultClient {
     view: Mutex<VaultView>,
     expected_key: Mutex<Option<String>>,
     known_committed_seq: std::sync::atomic::AtomicU64,
+    capacity_history: Mutex<Option<nddev_device_sync_domain::sync::history::HistoryVersion>>,
 }
 fn dependency<E>(_: E) -> Error {
     Error::Unavailable
@@ -104,6 +107,7 @@ impl VaultClient {
             view: Mutex::default(),
             expected_key: Mutex::default(),
             known_committed_seq: std::sync::atomic::AtomicU64::new(0),
+            capacity_history: Mutex::default(),
         };
         client.update_view().await?;
         #[cfg(target_arch = "wasm32")]
@@ -946,12 +950,61 @@ impl VaultClient {
             .await
             .map(|progress| progress.view)
     }
+    /// Shared Rust runtime needs actual inbox progress even while an Unknown
+    /// original prevents global freshness. Presentation still receives View.
+    pub async fn synchronize_progress(&self) -> Result<InboxProgress, Error> {
+        self.synchronize_batch(false).await
+    }
     /// Read authenticated history without claiming or sending local operations.
     /// The caller retains the core upload-capacity block independently: a
     /// successful read is not a capacity remedy. Read failures retain their own
     /// typed error/current projection; the caller still presents the upload block.
     pub async fn synchronize_inbox(&self) -> Result<InboxProgress, Error> {
         self.synchronize_batch(true).await
+    }
+    /// Authenticated history metadata for the Core capacity-check policy. A
+    /// newer floor alone is never proof that a pending original can be sent.
+    pub fn observed_history(
+        &self,
+    ) -> Option<nddev_device_sync_domain::sync::history::HistoryVersion> {
+        *self
+            .capacity_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+    fn record_history(
+        &self,
+        history: nddev_device_sync_domain::sync::history::HistoryVersion,
+    ) -> Result<(), Error> {
+        history.validate()?;
+        let mut old = self
+            .capacity_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if old.is_none_or(|old| history.head >= old.head && history.floor >= old.floor) {
+            *old = Some(history);
+        }
+        Ok(())
+    }
+    /// Rust runtime only: verify at most one immutable original through the
+    /// ordinary signed append and durable receipt/Unknown handling. No view
+    /// refresh may hide its already completed outcome behind a later read error.
+    pub async fn probe_capacity(&self) -> Result<Option<replica::CapacityProbeOutcome>, Error> {
+        self.authorized()?;
+        let _permit = self
+            .sync_gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Busy)?;
+        nddev_device_sync_accounts::runtime::timeout(replica::BATCH_DEADLINE, async {
+            self.prepare_identity().await?;
+            let port = history_replica::Replica::new(self).await?;
+            replica::probe_capacity(&port)
+                .await
+                .map(|progress| progress.capacity_probe)
+        })
+        .await
+        .map_err(dependency)?
     }
     async fn synchronize_batch(&self, inbox_only: bool) -> Result<InboxProgress, Error> {
         self.authorized()?;
@@ -972,10 +1025,12 @@ impl VaultClient {
         .map_err(dependency)
         .and_then(std::convert::identity);
         let inbox_at_head = result.as_ref().is_ok_and(|progress| progress.inbox_at_head);
+        let caught_up = result.as_ref().is_ok_and(|progress| progress.caught_up);
         self.finish_sync(result.map(|progress| progress.view))
             .map(|view| InboxProgress {
                 view,
                 inbox_at_head,
+                caught_up,
             })
     }
     // All entry points that synchronize share the same current error projection.
@@ -1219,6 +1274,7 @@ impl VaultClient {
         Ok(InboxProgress {
             view: view.clone(),
             inbox_at_head: progress.inbox_at_head,
+            caught_up: progress.caught_up,
         })
     }
 }

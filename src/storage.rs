@@ -98,6 +98,9 @@ pub(crate) enum Command {
     },
     Stats,
     Pending,
+    // A separate command makes an older worker refuse a one-root claim rather
+    // than silently marking the ordinary sixteen roots dispatched.
+    ClaimOne,
     Cursor,
     ObservationTarget {
         id: String,
@@ -194,6 +197,7 @@ impl Command {
             Self::DiscardCheckpoint { .. } => "vault.storage.checkpoint_discard",
             Self::Stats => "vault.storage.stats",
             Self::Pending => "vault.storage.claim",
+            Self::ClaimOne => "vault.storage.claim_one",
             Self::Cursor => "vault.storage.cursor",
             Self::ObservationTarget { .. } => "vault.storage.observation_target",
             Self::ObservationResolution { .. } => "vault.storage.observation_resolution",
@@ -405,6 +409,7 @@ pub(crate) fn execute(journal: &Journal, command: Command) -> Result<Reply, Erro
             Reply::Stats(pending, conflicts, cursor, at, local)
         }
         Command::Pending => Reply::Pending(journal.pending()?),
+        Command::ClaimOne => Reply::Pending(journal.claim_one()?),
         Command::Cursor => Reply::Cursor(journal.cursor()?),
         Command::ObservationTarget { id } => {
             Reply::ObservationTarget(journal.observation_target(&id)?)
