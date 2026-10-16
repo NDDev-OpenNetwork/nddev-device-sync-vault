@@ -1,5 +1,6 @@
 use super::*;
 mod capacity;
+mod scoped_resolution;
 use nddev_device_sync_domain::{
     repositories::catalog::{observations::*, *},
     state::{Snapshot, State},
@@ -1026,7 +1027,7 @@ fn resolution_writer(
         facts: journal.writer_snapshot().unwrap().facts,
         actual_key_id: key.id(),
         basis_seq: Some(capture.guard.cursor),
-        expected_local_revision: Some(capture.guard.local_revision),
+        expected_local_revision: None,
     }
 }
 
@@ -1145,16 +1146,16 @@ fn resolved_observation_refuses_incomplete_witnesses_changed_source_and_dispatch
         ),
         Err(Error::SelectionChanged)
     ));
-    let mut missing = writer.clone();
-    missing.expected_local_revision = None;
+    let mut missing = capture.guard.clone();
+    missing.repository_fingerprint = None;
     assert!(matches!(
         journal.enqueue_observation_resolution(
             new_resolution_body(&key, &selected, 1, 44, 44),
             1,
             capture.target.pending_id.clone(),
             (&selected, &before.selected_operation),
-            &missing,
-            &capture.guard
+            &writer,
+            &missing
         ),
         Err(Error::Invalid)
     ));
@@ -1177,7 +1178,7 @@ fn resolved_observation_refuses_incomplete_witnesses_changed_source_and_dispatch
     guard.local_revision = now.local_revision;
     let writer = WriterEnqueueGuard {
         facts: now.facts,
-        expected_local_revision: Some(now.local_revision),
+        expected_local_revision: None,
         ..writer
     };
     assert!(matches!(
@@ -1209,7 +1210,7 @@ fn resolution_command_cannot_lose_its_guard_or_downgrade_to_an_ordinary_write() 
     let capture = journal
         .observation_resolution("github:repo:9", &selected, &before.selected_operation)
         .unwrap();
-    let command = crate::storage::Command::EnqueueResolvedObservation {
+    let command = crate::storage::Command::EnqueueRepositoryResolution {
         body: new_resolution_body(&key, &selected, 1, 44, 44),
         expected_revision: 1,
         expected_pending: capture.target.pending_id.clone(),
@@ -1222,13 +1223,34 @@ fn resolution_command_cannot_lose_its_guard_or_downgrade_to_an_ordinary_write() 
     let payload = encoded
         .as_object_mut()
         .unwrap()
-        .remove("EnqueueResolvedObservation")
+        .remove("EnqueueRepositoryResolution")
         .unwrap();
+    assert!(
+        serde_json::from_value::<crate::storage::Command>(
+            serde_json::json!({"EnqueueResolvedObservation": payload.clone()})
+        )
+        .is_err()
+    );
+    let mut fingerprint_missing = payload.clone();
+    fingerprint_missing["resolution"]
+        .as_object_mut()
+        .unwrap()
+        .remove("repository_fingerprint");
+    let command = serde_json::from_value::<crate::storage::Command>(
+        serde_json::json!({"EnqueueRepositoryResolution": fingerprint_missing}),
+    )
+    .unwrap();
+    let stats = journal.stats().unwrap();
+    assert!(matches!(
+        crate::storage::execute(&journal, command),
+        Err(Error::Invalid)
+    ));
+    assert_eq!(journal.stats().unwrap(), stats);
     let mut missing = payload.clone();
     missing.as_object_mut().unwrap().remove("resolution");
     assert!(
         serde_json::from_value::<crate::storage::Command>(
-            serde_json::json!({"EnqueueResolvedObservation":missing})
+            serde_json::json!({"EnqueueRepositoryResolution":missing})
         )
         .is_err()
     );
