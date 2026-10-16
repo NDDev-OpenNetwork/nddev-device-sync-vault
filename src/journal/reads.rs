@@ -281,20 +281,19 @@ impl Journal {
     pub fn latest_clipboard(&self) -> Result<Option<(String, Entity)>, Error> {
         self.read(|connection| connection.query_row("SELECT revision,body,server_seq,EXISTS(SELECT 1 FROM v3_conflicts WHERE kind='clipboard_item' AND entity_id=v3_entities.id),NULL,revision,id FROM v3_entities WHERE kind='clipboard_item' AND server_seq>0 ORDER BY server_seq DESC LIMIT 1",[],|r|Ok((r.get(6)?,read_entity(r)?))).optional().map_err(sql_failed))
     }
-    pub fn state_page(
-        &self,
-        after: Option<(String, String)>,
-    ) -> Result<Vec<(String, String, Entity)>, Error> {
+    pub fn state_page(&self, after: Option<(String, String)>) -> Result<StateRows, Error> {
         self.read(|connection| {
+        let (cursor, local_revision) = catalog_revision(connection)?;
         let (kind, id) = after.map_or((None, None), |(k, i)| (Some(k), Some(i)));
         let mut query=connection.prepare("SELECT revision,body,server_seq,conflicted,pending_id,next_base,kind,id FROM local_entities WHERE kind IN ('device_state','module_state','account_state') AND (?1 IS NULL OR (kind,id)>(?1,?2)) ORDER BY kind,id LIMIT 51").map_err(sql_failed)?;
-        query
+        let entries = query
             .query_map(params![kind, id], |r| {
                 Ok((r.get(6)?, r.get(7)?, read_entity(r)?))
             })
             .map_err(sql_failed)?
             .collect::<Result<_, _>>()
-            .map_err(sql_failed)
+            .map_err(sql_failed)?;
+        Ok(StateRows { entries, cursor, local_revision })
         })
     }
     pub fn caught_up(&self, cursor: u64, at: u64) -> Result<bool, Error> {

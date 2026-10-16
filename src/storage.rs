@@ -252,7 +252,7 @@ pub(crate) enum Reply {
     Bool(bool),
     Clipboard(Option<(String, Entity)>),
     Enqueued(Enqueued),
-    States(Vec<(String, String, Entity)>),
+    States(crate::journal::StateRows),
     Done,
 }
 
@@ -623,7 +623,7 @@ impl Storage {
     pub async fn state_page(
         &self,
         after: Option<(String, String)>,
-    ) -> Result<Vec<(String, String, Entity)>, Error> {
+    ) -> Result<crate::journal::StateRows, Error> {
         match self.call(Command::States { after }).await? {
             Reply::States(v) => Ok(v),
             _ => Err(Error::Invalid),

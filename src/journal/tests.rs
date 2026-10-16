@@ -61,7 +61,7 @@ fn offline_state_from_another_writer_advances_local_revision_without_server_curs
     let (owned, reader, key) = owned_journal();
     let writer = Journal::open(owned.0.join("replica.db")).unwrap();
     let before = reader.stats().unwrap();
-    assert!(reader.state_page(None).unwrap().is_empty());
+    assert!(reader.state_page(None).unwrap().entries.is_empty());
     let first = encrypted_kind(
         &key,
         "device",
@@ -74,7 +74,12 @@ fn offline_state_from_another_writer_advances_local_revision_without_server_curs
     let observed = reader.stats().unwrap();
     assert_eq!(observed.2, before.2);
     assert!(observed.4 > before.4);
-    let page = reader.state_page(None).unwrap();
+    let snapshot = reader.state_page(None).unwrap();
+    assert_eq!(
+        (snapshot.cursor, snapshot.local_revision),
+        (observed.2, observed.4)
+    );
+    let page = snapshot.entries;
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].2.body, first);
     assert_eq!(page[0].2.revision, 0);
@@ -97,7 +102,10 @@ fn offline_state_from_another_writer_advances_local_revision_without_server_curs
     drop(reader);
     let reopened = Journal::open(owned.0.join("replica.db")).unwrap();
     assert_eq!(reopened.stats().unwrap(), latest);
-    assert_eq!(reopened.state_page(None).unwrap()[0].2.body, next);
+    let page = reopened.state_page(None).unwrap();
+    assert_eq!((page.cursor, page.local_revision), (latest.2, latest.4));
+    assert_eq!(page.entries[0].2.body, next);
+    assert_eq!(page.entries[0].2.pending_id.as_deref(), Some("state-2"));
     assert_eq!(reopened.pending().unwrap()[0].body, next);
 }
 fn result(id: &str, seq: i64) -> wire::Sync {
