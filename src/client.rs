@@ -1373,7 +1373,7 @@ fn scope(identity: &IdentityClient) -> Result<Scope, Error> {
 mod tests {
     use super::*;
 
-    async fn fixture_mode(receipt: &serde_json::Value, mode: &str) -> Result<(), Error> {
+    pub(super) async fn fixture_mode(receipt: &serde_json::Value, mode: &str) -> Result<(), Error> {
         let path = std::env::var("NDS_FIXTURE_RECEIPT").map_err(dependency)?;
         let control = receipt["control_file"].as_str().ok_or(Error::Invalid)?;
         std::fs::write(
@@ -1477,7 +1477,7 @@ mod tests {
         fixture_mode(receipt, "online").await?;
         result
     }
-    async fn fixture_identity() -> (serde_json::Value, Arc<IdentityClient>) {
+    pub(super) async fn fixture_identity() -> (serde_json::Value, Arc<IdentityClient>) {
         let receipt: serde_json::Value = serde_json::from_slice(
             &std::fs::read(std::env::var("NDS_FIXTURE_RECEIPT").unwrap()).unwrap(),
         )
@@ -1910,6 +1910,10 @@ mod tests {
 #[path = "checkpoint_client.rs"]
 mod checkpoint;
 pub use checkpoint::CheckpointStage;
+
+#[cfg(test)]
+#[path = "catalog_acceptance.rs"]
+mod catalog_acceptance;
 
 #[path = "history_replica.rs"]
 pub(crate) mod history_replica;

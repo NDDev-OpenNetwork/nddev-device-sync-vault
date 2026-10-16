@@ -14,6 +14,12 @@ native-acceptance:
 large-page-acceptance:
     cargo test --locked --features development-http --lib actual_native_large_page_catchup_preserves_bounds_and_freshness -- --ignored
 
+# Generated facts through real HTTP/PostgreSQL, then an offline SQLite reopen.
+# Requires check-postgres.py --fixture-sync3 and NDS_FIXTURE_RECEIPT.
+# Optimize the fixture workload while retaining the debug-only HTTP boundary.
+catalog-acceptance:
+    CARGO_PROFILE_TEST_OPT_LEVEL=3 cargo test --locked --features development-http --lib actual_1024_catalog_http_replay_and_offline_reopen -- --ignored --nocapture
+
 # Compile gate only; real browser storage/identity acceptance is separate.
 wasm-check:
     cargo clippy --locked --lib --target wasm32-unknown-unknown --jobs 4 -- -D warnings
