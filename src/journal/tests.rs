@@ -22,6 +22,16 @@ fn encrypted_at(key: &VaultKey, id: &str, entity: &str, revision: u64) -> Vec<u8
     encrypted_by(key, "device", id, entity, revision)
 }
 fn encrypted_by(key: &VaultKey, device: &str, id: &str, entity: &str, revision: u64) -> Vec<u8> {
+    encrypted_kind(key, device, id, entity, revision, EntityKind::VaultRecord)
+}
+fn encrypted_kind(
+    key: &VaultKey,
+    device: &str,
+    id: &str,
+    entity: &str,
+    revision: u64,
+    kind: EntityKind,
+) -> Vec<u8> {
     let scope = Scope {
         origin: "https://instance.example/".into(),
         tenant: "tenant".into(),
@@ -31,7 +41,7 @@ fn encrypted_by(key: &VaultKey, device: &str, id: &str, entity: &str, revision: 
     let mut operation = Operation {
         id: id.into(),
         device: DeviceId::new(device).unwrap(),
-        entity_kind: EntityKind::VaultRecord,
+        entity_kind: kind,
         entity_id: entity.into(),
         base_revision: revision,
         idempotency_key: id.into(),
@@ -45,6 +55,50 @@ fn encrypted_by(key: &VaultKey, device: &str, id: &str, entity: &str, revision: 
         .encrypt(&scope, &operation, b"PRIVATE_NATIVE_PLAINTEXT_NEVER_STORED")
         .unwrap();
     crate::codec::body(&operation).unwrap()
+}
+#[test]
+fn offline_state_from_another_writer_advances_local_revision_without_server_cursor() {
+    let (owned, reader, key) = owned_journal();
+    let writer = Journal::open(owned.0.join("replica.db")).unwrap();
+    let before = reader.stats().unwrap();
+    assert!(reader.state_page(None).unwrap().is_empty());
+    let first = encrypted_kind(
+        &key,
+        "device",
+        "state-1",
+        "device",
+        0,
+        EntityKind::DeviceState,
+    );
+    writer.enqueue(first.clone(), None, 0, None).unwrap();
+    let observed = reader.stats().unwrap();
+    assert_eq!(observed.2, before.2);
+    assert!(observed.4 > before.4);
+    let page = reader.state_page(None).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].2.body, first);
+    assert_eq!(page[0].2.revision, 0);
+    assert_eq!(page[0].2.pending_id.as_deref(), Some("state-1"));
+    let next = encrypted_kind(
+        &key,
+        "device",
+        "state-2",
+        "device",
+        0,
+        EntityKind::DeviceState,
+    );
+    writer
+        .enqueue(next.clone(), None, 0, Some("state-1".into()))
+        .unwrap();
+    let latest = reader.stats().unwrap();
+    assert_eq!(latest.2, before.2);
+    assert!(latest.4 > observed.4);
+    drop(writer);
+    drop(reader);
+    let reopened = Journal::open(owned.0.join("replica.db")).unwrap();
+    assert_eq!(reopened.stats().unwrap(), latest);
+    assert_eq!(reopened.state_page(None).unwrap()[0].2.body, next);
+    assert_eq!(reopened.pending().unwrap()[0].body, next);
 }
 fn result(id: &str, seq: i64) -> wire::Sync {
     wire::Sync::Applied(wire::SyncApplied {
