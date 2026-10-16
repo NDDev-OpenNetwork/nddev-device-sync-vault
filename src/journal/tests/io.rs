@@ -4,6 +4,66 @@ fn original_result(id: &str, revision: i64, seq: i64) -> Vec<u8> {
     serde_json::to_vec_pretty(&applied(id, revision, seq)).unwrap()
 }
 #[test]
+fn capacity_claim_dispatches_one_exact_root_and_preserves_unknown_and_other_work() {
+    let (owned, journal, key) = owned_journal();
+    let bodies = (0..16)
+        .map(|i| encrypted(&key, &format!("pending-{i}"), &format!("record-{i}")))
+        .collect::<Vec<_>>();
+    for body in &bodies {
+        journal.enqueue(body.clone(), None, 0, None).unwrap();
+    }
+    let command = crate::storage::Command::ClaimOne;
+    assert_eq!(
+        serde_json::to_value(&command).unwrap(),
+        serde_json::json!("ClaimOne")
+    );
+    let crate::storage::Reply::Pending(first) = crate::storage::execute(&journal, command).unwrap()
+    else {
+        panic!("pending reply")
+    };
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].body, bodies[0]);
+    let connection = Connection::open(owned.0.join("replica.db")).unwrap();
+    let dispatched = || {
+        connection
+            .query_row(
+                "SELECT count(*) FROM v3_outbox WHERE dispatched=1",
+                [],
+                |r| r.get::<_, u32>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(dispatched(), 1);
+    let reopened = Journal::open(owned.0.join("replica.db")).unwrap();
+    assert_eq!(reopened.claim_one().unwrap()[0].body, bodies[0]);
+    assert_eq!(dispatched(), 1);
+    reopened
+        .mark_unknown(&first[0].id, &first[0].body, "legacy_missing")
+        .unwrap();
+    let second = reopened.claim_one().unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].body, bodies[1]);
+    assert_eq!(dispatched(), 2);
+    let original: Vec<u8> = connection
+        .query_row(
+            "SELECT body FROM v3_outbox WHERE id=?1 AND terminal_unknown_reason='legacy_missing'",
+            [&first[0].id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(original, bodies[0]);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM v3_outbox WHERE dispatched=0",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+        14
+    );
+}
+#[test]
 fn writer_provenance_distinguishes_preexisting_legacy_from_fresh_bootstrap_and_reopen() {
     let (owned, j, key) = owned_journal();
     let initial = j.writer_snapshot().unwrap();
