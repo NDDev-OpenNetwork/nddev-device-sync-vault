@@ -116,10 +116,9 @@ claims protection from explicit site-data removal. Admission allows at most
 four concurrent storage calls, with a 500 ms wait for the connection; local
 acknowledgement is a completed storage transaction, not a cloud acknowledgement.
 
-The owning Cargo root selects the canonical Core Git source for both direct and
-transitive legacy Core URLs. Cargo ignores patches declared by dependencies:
-consuming application roots must select the same source and verify one Core
-package graph until their immutable transitive manifests have been adopted.
+Direct and transitive NDS dependencies use canonical immutable Git sources.
+Consuming applications verify one Core/Accounts/Vault package graph; dependency
+updates must preserve that agreement without consumer-only source overrides.
 
 Repository conflict capture retains the actual committed observation, latest
 conflict original/receipt and any undispatched local intent after reopen. All
@@ -128,8 +127,13 @@ are not substituted for witnesses. Dispatched families are refused until their
 real outcome is known. Captured evidence does not itself resolve or delete a
 conflict. `resolve_repository_observation` confirms fresh provider input through
 Core, then queues a new operation against the observed committed revision. Its
-separate storage command rechecks source, writer, cursor/local revision and all
-scoped lifecycle witnesses together. The old conflict survives queueing/reopen
+separate storage command rechecks source, writer and a fingerprint of the exact
+committed bytes, target metadata, pending operation/dispatch/lineage and every
+scoped conflict request/receipt in one transaction. Unrelated writes and forward
+history do not invalidate that proof; rollback or any family change does. Older
+workers reject the new command instead of ignoring its required fingerprint.
+Ordinary Vault record choices retain their existing global revision guard.
+The old conflict survives queueing/reopen
 and another Conflict receipt; only the actual Applied receipt retires it.
 Blocked undispatched intents without a server receipt use the same explicit
 fresh-read transition, preserving the committed lifecycle without inventing a
