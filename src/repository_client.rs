@@ -500,6 +500,9 @@ impl VaultClient {
             return Err(Error::Invalid);
         }
         self.validate_repository_read(&read).await?;
+        if raw.guard.repository_fingerprint.is_none() {
+            return Err(Error::Invalid);
+        }
         Ok(RepositoryResolution {
             read,
             current,
@@ -549,8 +552,7 @@ impl VaultClient {
             crate::storage::Reply::WriterSnapshot(value) => value,
             _ => return Err(Error::Invalid),
         };
-        if writer.local_revision != resolution.guard.local_revision
-            || writer.cursor != resolution.guard.cursor
+        if writer.cursor < resolution.guard.cursor
             || resolution.guard.lifecycle.resolved_through_seq > writer.cursor
         {
             return Ok(RepositoryPublication::ReRead);

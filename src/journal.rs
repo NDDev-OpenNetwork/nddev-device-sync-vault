@@ -50,6 +50,17 @@ pub(crate) struct ResolutionGuard {
     pub cursor: u64,
     pub local_revision: u64,
     pub lifecycle: nddev_device_sync_domain::sync::history::Lifecycle,
+    /// Required for repository resolution. Binds exact scoped encrypted state;
+    /// ordinary Vault record choices retain their existing global revision guard.
+    pub repository_fingerprint: Option<[u8; 32]>,
+}
+impl ResolutionGuard {
+    pub(crate) fn repository_matches(&self, current: &Self) -> bool {
+        self.repository_fingerprint.is_some()
+            && self.repository_fingerprint == current.repository_fingerprint
+            && self.lifecycle == current.lifecycle
+            && self.cursor <= current.cursor
+    }
 }
 pub(crate) struct ObservationEnqueueGuard<'a> {
     pub selected: &'a nddev_device_sync_domain::repositories::catalog::CredentialSelection,
@@ -249,6 +260,7 @@ mod outbox;
 mod writer;
 pub(crate) use writer::{WriterEnqueueGuard, WriterSnapshot};
 mod reads;
+mod resolution;
 mod schema;
 use apply::apply;
 #[cfg(test)]
