@@ -11,6 +11,22 @@ use nddev_device_sync_domain::repositories::catalog::{
 use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;
 
+fn originals(vault: &VaultClient) -> Result<BTreeMap<String, Vec<u8>>, Error> {
+    let db = rusqlite::Connection::open_with_flags(
+        vault.journal.path_for_acceptance(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(dependency)?;
+    let mut query = db
+        .prepare("SELECT id,body FROM v3_outbox")
+        .map_err(dependency)?;
+    query
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(dependency)?
+        .collect::<Result<_, _>>()
+        .map_err(dependency)
+}
+
 // Timed-out callers do not release an in-flight OS credential operation. Let
 // that actual completion settle before deleting this fixture's credentials.
 async fn after_io<T, F>(
@@ -34,8 +50,38 @@ where
 }
 
 async fn settle(vault: &VaultClient) -> Result<VaultView, Error> {
+    use nddev_device_sync_application::lifecycle::{BatchOutcome, ReplicaSchedule};
+    let mut schedule = ReplicaSchedule::default();
     for _ in 0..128 {
-        let progress = vault.synchronize_attempt(false).await?.result?;
+        let before = originals(vault)?;
+        let attempt = vault.synchronize_attempt(false).await?.result;
+        for (id, body) in originals(vault)? {
+            assert!(
+                before.get(&id) == Some(&body),
+                "sync changed a pending original"
+            );
+        }
+        let progress = match attempt {
+            Ok(progress) => progress,
+            Err(Error::Busy) => {
+                // Real signed-request admission can fill its nonce window.
+                // Use the same Core backoff as the client, with unchanged
+                // durable originals; never raise the quota or alter clocks.
+                let delay = schedule.after(BatchOutcome::Retryable).unwrap();
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"event":"catalog.acceptance.backoff", "reason":"busy", "delay_ms":delay.as_millis()})
+                );
+                nddev_device_sync_accounts::runtime::sleep(delay).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        schedule.after(if progress.caught_up {
+            BatchOutcome::CaughtUp
+        } else {
+            BatchOutcome::CatchingUp
+        });
         if progress.caught_up {
             assert!(progress.inbox_at_head && progress.view.pending == 0);
             assert_eq!(progress.view.conflicts, 0);
@@ -121,7 +167,7 @@ async fn catalog(vault: &VaultClient) -> Result<BTreeMap<String, (ObservationDat
             assert!(target.version.pending_id.is_none() && !target.version.conflicted);
             let value = (target.value.unwrap().data, target.version.revision);
             if let Some(old) = saved.insert(target.key.entity_id(), value.clone()) {
-                assert_eq!(old, value); // Owner profiles repeat only as equal joins.
+                assert!(old == value, "joined owner profile changed");
             }
         }
         after = page.next;
@@ -230,12 +276,18 @@ async fn exercise(
     assert_eq!(publish(&vault, &context, &values).await?, 1056);
     let first = settle(&vault).await?;
     assert_eq!(first.cursor, 1057); // One credential and one write per fact.
-    assert_eq!(catalog(&vault).await?, expected);
+    assert!(
+        catalog(&vault).await? == expected,
+        "published catalog differs from input"
+    );
     phase("published", first.cursor);
     let reader_directory = directory.join("reader");
     let reader = VaultClient::new(identity.clone(), reader_directory.clone()).await?;
     assert_eq!(settle(&reader).await?.cursor, first.cursor);
-    assert_eq!(catalog(&reader).await?, expected);
+    assert!(
+        catalog(&reader).await? == expected,
+        "received catalog differs from input"
+    );
     assert_eq!(publish(&vault, &context, &values).await?, 0);
     assert_eq!(settle(&vault).await?.cursor, first.cursor);
     phase("unchanged", first.cursor);
@@ -261,8 +313,14 @@ async fn exercise(
     let end = settle(&vault).await?;
     assert_eq!(end.cursor, first.cursor + 32);
     assert_eq!(settle(&reader).await?.cursor, end.cursor);
-    assert_eq!(catalog(&vault).await?, expected);
-    assert_eq!(catalog(&reader).await?, expected);
+    assert!(
+        catalog(&vault).await? == expected,
+        "updated catalog differs from input"
+    );
+    assert!(
+        catalog(&reader).await? == expected,
+        "received changes differ from input"
+    );
     phase("changes_converged", end.cursor);
     assert_eq!(
         expected
@@ -279,7 +337,10 @@ async fn exercise(
         (local.cursor, local.pending, local.conflicts),
         (end.cursor, 0, 0)
     );
-    assert_eq!(catalog(&reopened).await?, expected);
+    assert!(
+        catalog(&reopened).await? == expected,
+        "offline catalog differs from input"
+    );
     phase("offline_reopened", end.cursor);
     Ok(())
 }
