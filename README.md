@@ -166,11 +166,14 @@ absolute output directory outside this repository. The default is 32 clients;
 
 One genuinely authenticated generated fixture session is restored through
 private Rust IPC into the separate native stores. Each client enrolls its own
-signing key; the supervisor never receives session credentials. Product quotas
-and clocks stay unchanged: provisioning 32 new devices from one source takes
-about 45 minutes under the existing enrollment rate limit. The test covers
+signing key; the supervisor never receives session credentials. After the first
+sign-in, up to eight clients initialize concurrently. Product quotas and clocks
+stay unchanged; actual server admission determines enrollment time. The test covers
 concurrent catalog reads and unchanged observations, competing writes and scoped
 resolution, independent offline edits, actual client process restarts and replay.
+Each process writes its real output to a bounded private file, compressed after
+process exit so compression cannot stall the live stdout reader. Raw capture is
+bounded to 128 MiB per process and total raw/compressed artifacts to 2 GiB.
 All producer records are retained as bounded gzip artifacts; sequence gaps,
 SDK loss and sink failures fail the check. This tests NDS synchronization with
 generated inputs, not GitHub-provider discovery or 32 different hardware devices.

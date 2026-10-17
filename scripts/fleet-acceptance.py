@@ -35,6 +35,7 @@ def worker(root,executable,index,count,output):
                     child=subprocess.Popen([executable,'--exact',TEST,'--ignored','--nocapture'],env=env,stdout=log,stderr=subprocess.STDOUT)
                     status=child.wait(timeout=3500)
                 raw_bytes=raw.stat().st_size
+                if raw_bytes>128*1024**2:raise RuntimeError('Fleet raw capture budget exceeded')
                 with raw.open('rb') as source,gzip.open(output/f'client-{index}-{epoch}.log.gz','wb',compresslevel=1) as destination:
                     shutil.copyfileobj(source,destination,65536)
                 (output/f'client-{index}-{epoch}-capture.json').write_text(json.dumps({'raw_bytes':raw_bytes,'compressed_bytes':(output/f'client-{index}-{epoch}.log.gz').stat().st_size})+'\n')
@@ -94,7 +95,8 @@ def check():
     for path in args.output.glob('*.raw'):
         try:raw_sizes.append(path.stat().st_size)
         except FileNotFoundError:pass  # Completed workers remove their raw spool.
-    if any(size>128*1024**2 for size in raw_sizes) or sum(raw_sizes)>2*1024**3:
+    compressed=sum(path.stat().st_size for path in args.output.glob('*.log.gz'))
+    if any(size>128*1024**2 for size in raw_sizes) or sum(raw_sizes)+compressed>2*1024**3:
         raise RuntimeError('Fleet raw capture budget exceeded')
 
 def receive(connection,index,timeout=600):
@@ -151,10 +153,7 @@ with tempfile.TemporaryDirectory(prefix='nds-fleet-') as directory:
         hello=read(expected,30);assert hello=={'index':expected,'epoch':epoch}
         send(expected,'initialize');return read(expected,1000 if epoch==0 else 60)
     try:
-        # Sequential enrollment respects the real ten-per-15-minute source limit.
-        # All admitted clients subsequently execute the same phases concurrently.
-        ready=[]
-        for index in range(args.clients):
+        def start_client(index):
             root=base/str(index)
             for name in ['data/keyrings','state','config','cache','runtime','control']:(root/name).mkdir(parents=True,mode=0o700)
             env={k:v for k,v in os.environ.items() if k in ['PATH','HOME','LANG','LC_ALL','LD_LIBRARY_PATH']}
@@ -163,9 +162,27 @@ with tempfile.TemporaryDirectory(prefix='nds-fleet-') as directory:
             log=(args.output/f'supervisor-{index}.log').open('wb')
             try:processes.append(subprocess.Popen(['dbus-run-session','--',sys.executable,__file__,'--worker',str(root),executable,str(index),str(args.clients),str(args.output)],env=env,stdout=log,stderr=log,start_new_session=True))
             finally:log.close()
-            ready.append(connect(index,0));event('enrolled',clients=len(ready))
-        assert len({r['device'] for r in ready})==args.clients
-        assert len({(r['user'],r['tenant']) for r in ready})==1
+        # The first real sign-in starts the private session broker. Subsequent
+        # devices initialize in bounded batches matching the eight pending slots.
+        # Each still has its own key, proof, credential service and replica.
+        ready={}
+        start_client(0);ready[0]=connect(0,0);event('enrolled',clients=1)
+        for begin in range(1,args.clients,8):
+            batch=set(range(begin,min(begin+8,args.clients)))
+            for index in sorted(batch):start_client(index)
+            accepted=set()
+            while accepted!=batch:
+                check()
+                try:connection,_=listener.accept()
+                except socket.timeout:continue
+                connection.settimeout(1)
+                hello=receive(connection,'enrollment',30)
+                index=hello['index'];assert hello['epoch']==0 and index in batch and index not in accepted
+                sockets[index]=connection;accepted.add(index);send(index,'initialize')
+            for index in sorted(batch):
+                ready[index]=read(index,1000);event('enrolled',clients=len(ready))
+        assert len({r['device'] for r in ready.values()})==args.clients
+        assert len({(r['user'],r['tenant']) for r in ready.values()})==1
         send(0,'seed');seed=read(0);assert seed['cursor']==1057;event('seeded',repositories=1024)
         uniform(all_clients('inspect',updated=False,offline=False))
         unchanged=all_clients('unchanged');assert all(x['unchanged'] and x['cursor']==1057 for x in unchanged)
