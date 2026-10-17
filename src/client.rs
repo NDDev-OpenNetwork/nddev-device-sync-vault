@@ -1915,6 +1915,10 @@ pub use checkpoint::CheckpointStage;
 #[path = "catalog_acceptance.rs"]
 mod catalog_acceptance;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "fleet_acceptance.rs"]
+mod fleet_acceptance;
+
 #[path = "history_replica.rs"]
 pub(crate) mod history_replica;
 

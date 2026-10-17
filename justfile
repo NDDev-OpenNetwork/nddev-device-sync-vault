@@ -20,6 +20,11 @@ large-page-acceptance:
 catalog-acceptance:
     CARGO_PROFILE_TEST_OPT_LEVEL=3 cargo test --locked --features development-http --lib actual_1024_catalog_http_replay_and_offline_reopen -- --ignored --nocapture
 
+# Linux fleet: real isolated credential services and production Rust clients.
+# Precompile before starting a fresh --fixture-sync3 --fixture-seconds 3600 server.
+fleet-acceptance:
+    python3 scripts/fleet-acceptance.py --fixture "$NDS_FIXTURE_RECEIPT" --output "$NDS_FLEET_OUTPUT" --clients "${NDS_FLEET_CLIENTS:-32}"
+
 # Compile gate only; real browser storage/identity acceptance is separate.
 wasm-check:
     cargo clippy --locked --lib --target wasm32-unknown-unknown --jobs 4 -- -D warnings

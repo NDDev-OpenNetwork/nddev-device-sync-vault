@@ -152,5 +152,28 @@ The old conflict survives queueing/reopen
 and another Conflict receipt; only the actual Applied receipt retires it.
 Blocked undispatched intents without a server receipt use the same explicit
 fresh-read transition, preserving the committed lifecycle without inventing a
-receipt or deriving it from the cursor. The automatic catalog caller has not
-yet adopted resolution.
+receipt or deriving it from the cursor.
+
+`just fleet-acceptance` qualifies 1024 generated repository facts with independent
+Linux Rust clients, real Secret Service stores, SQLite and the isolated HTTP
+backend. It requires `dbus-run-session`, `gnome-keyring-daemon` and `gdbus`.
+Precompile the test binary with
+`CARGO_PROFILE_TEST_OPT_LEVEL=3 cargo test --locked --features development-http --lib --no-run`,
+then start a fresh server fixture with `--fixture-sync3 --fixture-seconds 3600`.
+Set `NDS_FIXTURE_RECEIPT` to its private receipt and `NDS_FLEET_OUTPUT` to a new
+absolute output directory outside this repository. The default is 32 clients;
+`NDS_FLEET_CLIENTS=2` runs a supervisor smoke check, not fleet qualification.
+
+One genuinely authenticated generated fixture session is restored through
+private Rust IPC into the separate native stores. Each client enrolls its own
+signing key; the supervisor never receives session credentials. After the first
+sign-in, up to eight clients initialize concurrently. Product quotas and clocks
+stay unchanged; actual server admission determines enrollment time. The test covers
+concurrent catalog reads and unchanged observations, competing writes and scoped
+resolution, independent offline edits, actual client process restarts and replay.
+Each process writes its real output to a bounded private file, compressed after
+process exit so compression cannot stall the live stdout reader. Raw capture is
+bounded to 128 MiB per process and total raw/compressed artifacts to 2 GiB.
+All producer records are retained as bounded gzip artifacts; sequence gaps,
+SDK loss and sink failures fail the check. This tests NDS synchronization with
+generated inputs, not GitHub-provider discovery or 32 different hardware devices.
