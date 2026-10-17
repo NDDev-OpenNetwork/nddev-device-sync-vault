@@ -27,4 +27,4 @@ fleet-acceptance:
 
 # Compile gate only; real browser storage/identity acceptance is separate.
 wasm-check:
-    cargo clippy --locked --lib --target wasm32-unknown-unknown --jobs 4 -- -D warnings
+    cargo clippy --locked --lib --features browser-bindings --target wasm32-unknown-unknown --jobs 4 -- -D warnings

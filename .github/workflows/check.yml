@@ -53,7 +53,7 @@ jobs:
         with:
           node-version: '24.22.0'
       - run: rustup toolchain install 1.99.1 --profile minimal --component clippy --target wasm32-unknown-unknown
-      - run: cargo clippy --locked --lib --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy --locked --lib --features browser-bindings --target wasm32-unknown-unknown -- -D warnings
   quality:
     if: always()
     needs: [native, dependencies, wasm]
