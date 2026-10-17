@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Qualify real isolated Linux NDS clients; never resets product quotas or clocks."""
 from pathlib import Path
-import argparse,gzip,json,os,re,secrets,shutil,signal,socket,subprocess,sys,tempfile,threading,time
+import argparse,gzip,json,os,re,secrets,shutil,signal,socket,subprocess,sys,tempfile,time
 
 ROOT=Path(__file__).resolve().parents[1]
 TEST='client::fleet_acceptance::native_fleet_member'
@@ -9,7 +9,7 @@ TEST='client::fleet_acceptance::native_fleet_member'
 def worker(root,executable,index,count,output):
     root=Path(root);output=Path(output)
     assert Path(os.environ['XDG_DATA_HOME'])==root/'data' and (root/'data/keyrings').is_dir()
-    child=None;thread=None
+    child=None
     def interrupted(_signal,_frame):raise KeyboardInterrupt
     signal.signal(signal.SIGTERM,interrupted)
     with (output/f'daemon-{index}.log').open('wb') as log:
@@ -27,19 +27,18 @@ def worker(root,executable,index,count,output):
             else:raise RuntimeError('Owned credential service did not initialize')
             for epoch in [0,1]:
                 env=os.environ|{'NDS_FLEET_EPOCH':str(epoch)}
-                child=subprocess.Popen([executable,'--exact',TEST,'--ignored','--nocapture'],env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-                raw_bytes=[0];capture_error=[]
-                def capture():
-                    try:
-                        with gzip.open(output/f'client-{index}-{epoch}.log.gz','wb',compresslevel=1) as log:
-                            while chunk:=child.stdout.read(65536):
-                                raw_bytes[0]+=len(chunk)
-                                log.write(chunk)
-                    except Exception as error:capture_error.append(type(error).__name__)
-                thread=threading.Thread(target=capture);thread.start()
-                status=child.wait(timeout=3500);thread.join(timeout=10)
-                if thread.is_alive() or capture_error:raise RuntimeError('Lossless log capture failed')
-                (output/f'client-{index}-{epoch}-capture.json').write_text(json.dumps({'raw_bytes':raw_bytes[0],'compressed_bytes':(output/f'client-{index}-{epoch}.log.gz').stat().st_size})+'\n')
+                # Compression must not become an artificial slow stdout reader
+                # for32 simultaneous clients. Preserve the real output directly;
+                # compress only after that process has closed its logger.
+                raw=output/f'client-{index}-{epoch}.raw'
+                with raw.open('xb') as log:
+                    child=subprocess.Popen([executable,'--exact',TEST,'--ignored','--nocapture'],env=env,stdout=log,stderr=subprocess.STDOUT)
+                    status=child.wait(timeout=3500)
+                raw_bytes=raw.stat().st_size
+                with raw.open('rb') as source,gzip.open(output/f'client-{index}-{epoch}.log.gz','wb',compresslevel=1) as destination:
+                    shutil.copyfileobj(source,destination,65536)
+                (output/f'client-{index}-{epoch}-capture.json').write_text(json.dumps({'raw_bytes':raw_bytes,'compressed_bytes':(output/f'client-{index}-{epoch}.log.gz').stat().st_size})+'\n')
+                raw.unlink()
                 if status:raise RuntimeError(f'Client {index} epoch {epoch} exited {status}')
                 child=None
         finally:
@@ -47,7 +46,6 @@ def worker(root,executable,index,count,output):
                 child.terminate()
                 try:child.wait(timeout=5)
                 except subprocess.TimeoutExpired:child.kill();child.wait()
-            if thread is not None:thread.join(timeout=5)
             daemon.terminate()
             try:daemon.wait(timeout=5)
             except subprocess.TimeoutExpired:daemon.kill();daemon.wait()
@@ -91,6 +89,13 @@ def check():
     for i,p in enumerate(processes):
         if p.poll() is not None and p.returncode!=0:raise RuntimeError(f'Owned client supervisor {i} exited {p.returncode}')
     if any(p.stat().st_size>64*1024**2 for p in args.output.glob('*.log*')):raise RuntimeError('Fleet log budget exceeded')
+    # These are test-artifact bounds, not SDK queue sizes or product quotas.
+    raw_sizes=[]
+    for path in args.output.glob('*.raw'):
+        try:raw_sizes.append(path.stat().st_size)
+        except FileNotFoundError:pass  # Completed workers remove their raw spool.
+    if any(size>128*1024**2 for size in raw_sizes) or sum(raw_sizes)>2*1024**3:
+        raise RuntimeError('Fleet raw capture budget exceeded')
 
 def receive(connection,index,timeout=600):
     end=min(deadline,time.monotonic()+timeout)
