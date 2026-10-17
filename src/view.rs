@@ -1,5 +1,13 @@
 //! Public presentation metadata and redacted error classes only.
 #[derive(Clone, Default)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    derive(tsify::Tsify, serde::Serialize)
+)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    tsify(large_number_types_as_bigints, missing_as_null)
+)]
 pub struct VaultView {
     pub unlocked: bool,
     pub key_id: String,
@@ -16,6 +24,14 @@ pub struct VaultView {
     pub browser_persistent: Option<bool>,
 }
 #[derive(Clone)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    derive(tsify::Tsify, serde::Serialize)
+)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    tsify(large_number_types_as_bigints, missing_as_null)
+)]
 pub struct ConflictView {
     pub title: String,
     pub username: String,
@@ -23,6 +39,14 @@ pub struct ConflictView {
     pub deleted: bool,
 }
 #[derive(Clone)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    derive(tsify::Tsify, serde::Serialize)
+)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    tsify(large_number_types_as_bigints, missing_as_null)
+)]
 pub struct RecordView {
     pub observed_seq: u64,
     pub deleted: bool,
@@ -37,6 +61,14 @@ pub struct RecordView {
 }
 
 #[derive(Clone)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    derive(tsify::Tsify, serde::Serialize)
+)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    tsify(large_number_types_as_bigints, missing_as_null)
+)]
 pub struct RecordPage {
     pub observed_seq: u64,
     pub local_revision: u64,
@@ -46,6 +78,14 @@ pub struct RecordPage {
 }
 
 #[derive(Clone)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    derive(tsify::Tsify, serde::Serialize)
+)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    tsify(large_number_types_as_bigints, missing_as_null)
+)]
 pub struct StateView {
     pub kind: String,
     pub id: String,
@@ -64,6 +104,14 @@ pub struct StateView {
     pub conflicted: bool,
 }
 #[derive(Clone)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    derive(tsify::Tsify, serde::Serialize)
+)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    tsify(large_number_types_as_bigints, missing_as_null)
+)]
 pub struct StatePage {
     pub observed_seq: u64,
     pub local_revision: u64,
@@ -107,6 +155,14 @@ impl VaultError {
 
 /// Clipboard metadata only; plaintext is consumed by the native OS adapter.
 #[derive(Clone, Default)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    derive(tsify::Tsify, serde::Serialize)
+)]
+#[cfg_attr(
+    all(target_arch = "wasm32", feature = "browser-bindings"),
+    tsify(large_number_types_as_bigints, missing_as_null)
+)]
 pub struct ClipboardView {
     pub present: bool,
     pub id: String,
