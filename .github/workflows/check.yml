@@ -25,6 +25,8 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev
       - run: cargo fmt --check
       - run: cargo test --locked --all-features
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -51,7 +53,7 @@ jobs:
         with:
           node-version: '24.22.0'
       - run: rustup toolchain install 1.99.1 --profile minimal --component clippy --target wasm32-unknown-unknown
-      - run: cargo clippy --locked --lib --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy --locked --lib --features browser-bindings --target wasm32-unknown-unknown -- -D warnings
   quality:
     if: always()
     needs: [native, dependencies, wasm]

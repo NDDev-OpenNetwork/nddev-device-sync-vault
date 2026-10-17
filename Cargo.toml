@@ -7,11 +7,12 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-vault"
 
 [features]
+browser-bindings = ["dep:tsify"]
 default = []
 development-http = ["nddev-device-sync-accounts/development-http"]
 
 [dependencies]
-nddev-device-sync-application = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "cdd04c938fa836921337461f3322c26426f3fbb0" }
+nddev-device-sync-application = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "0135c86b2887c7cea96c0f1082d70560bde00cc6" }
 base64 = "0.23.1"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
@@ -19,11 +20,11 @@ serde_json = "1"
 zeroize = { version = "1.8", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
-nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "40f1f799a395f67e7a565e9c0c9f4b5ba7fdbe67" }
+nddev-device-sync-telemetry = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability", rev = "1327eb1fc1a31bd767582d1fa204d2ae204b89df" }
 time = { version = "0.3", features = ["wasm-bindgen"] }
 uuid = { version = "1.27", features = ["v4"] }
-nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "cdd04c938fa836921337461f3322c26426f3fbb0" }
-nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "a644d56eadaee582ddc654439c948907d7135074" }
+nddev-device-sync-domain = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", rev = "0135c86b2887c7cea96c0f1082d70560bde00cc6" }
+nddev-device-sync-accounts = { git = "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts", rev = "101365418cf5a7fa0dd680af1ed72c357070a9ed" }
 
 tokio = { version = "1.53", features = ["rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -42,6 +43,7 @@ tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rusqlite = { version = "=0.40.2", default-features = false, features = ["libsqlite3-sys", "bundled", "fallible_uint"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+tsify = { version = "=0.5.8", default-features = false, features = ["js"], optional = true }
 rusqlite = { version="=0.40.2",default-features=false,features=["ffi-sqlite-wasm-rs","fallible_uint"] }
 # rusqlite 0.40.2 requires sqlite-wasm-rs 0.5; VFS 0.3 uses incompatible
 # rsqlite-vfs 0.2 callbacks. Upgrade this pair with a compatible rusqlite release.

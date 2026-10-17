@@ -4,3 +4,9 @@ allow = ["AGPL-3.0-only", "Apache-2.0", "BSD-3-Clause", "CDLA-Permissive-2.0", "
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-git = ["https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-core.git", "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-accounts.git", "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-protocol.git", "https://github.com/NDDev-Technocracy-OpenNetwork-NDS/nddev-device-sync-observability"]
+
+# Native libsecret build-time target detection; reviewed permissive exception.
+[[licenses.exceptions]]
+name = "target-lexicon"
+version = "=0.13.5"
+allow = ["Apache-2.0 WITH LLVM-exception"]
