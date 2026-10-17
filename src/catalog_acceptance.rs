@@ -11,17 +11,17 @@ use nddev_device_sync_domain::repositories::catalog::{
 use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;
 
-fn originals(vault: &VaultClient) -> Result<BTreeMap<String, Vec<u8>>, Error> {
+pub(super) fn originals(vault: &VaultClient) -> Result<BTreeMap<String, Vec<u8>>, Error> {
     let db = rusqlite::Connection::open_with_flags(
         vault.journal.path_for_acceptance(),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .map_err(dependency)?;
     let mut query = db
-        .prepare("SELECT id,body FROM v3_outbox")
+        .prepare("SELECT id,body FROM v3_outbox UNION ALL SELECT json_extract(CAST(body AS TEXT),'$.operation_id'),body FROM v3_conflicts WHERE json_extract(CAST(body AS TEXT),'$.device_id')=?1")
         .map_err(dependency)?;
     query
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map([&vault.scope.device], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(dependency)?
         .collect::<Result<_, _>>()
         .map_err(dependency)
@@ -49,7 +49,7 @@ where
     .map_err(|_| nddev_device_sync_accounts::ClientError::Timeout)?
 }
 
-async fn settle(vault: &VaultClient) -> Result<VaultView, Error> {
+pub(super) async fn settle(vault: &VaultClient) -> Result<VaultView, Error> {
     use nddev_device_sync_application::lifecycle::{BatchOutcome, ReplicaSchedule};
     let mut schedule = ReplicaSchedule::default();
     for _ in 0..128 {
@@ -92,7 +92,7 @@ async fn settle(vault: &VaultClient) -> Result<VaultView, Error> {
     Err(Error::Unavailable)
 }
 
-async fn publish(
+pub(super) async fn publish(
     vault: &VaultClient,
     context: &ObservationContext,
     values: &[ObservationData],
@@ -153,7 +153,9 @@ async fn publish(
     Ok(queued)
 }
 
-async fn catalog(vault: &VaultClient) -> Result<BTreeMap<String, (ObservationData, u64)>, Error> {
+pub(super) async fn catalog(
+    vault: &VaultClient,
+) -> Result<BTreeMap<String, (ObservationData, u64)>, Error> {
     let mut after = None;
     let mut saved = BTreeMap::new();
     let mut pages = 0;
@@ -235,29 +237,7 @@ async fn exercise(
         selection: CredentialSelection::new("catalog-credential".into(), 1, None).unwrap(),
         scan_id: "generated-catalog".into(),
     };
-    let mut values = (1..=32)
-        .map(|id| ObservationData::Owner {
-            owner: GithubOwner {
-                id: GithubAccountId::new(id).unwrap(),
-                kind: if id == 1 {
-                    GithubOwnerKind::User
-                } else {
-                    GithubOwnerKind::Organization
-                },
-                login: format!("generated-owner-{id}"),
-            },
-        })
-        .collect::<Vec<_>>();
-    values.extend((1..=1024).map(|id| ObservationData::Repository {
-        repository: RepositoryFact {
-            id: RepositoryId::new(id).unwrap(),
-            owner_id: GithubAccountId::new(1 + (id - 1) % 32).unwrap(),
-            name: format!("generated-repository-{id}"),
-            visibility: RepositoryVisibility::Private,
-            archived: false,
-            default_branch: Some("main".into()),
-        },
-    }));
+    let values = generated_values();
     let mut expected: BTreeMap<_, _> = values
         .iter()
         .map(|data| {
@@ -369,4 +349,31 @@ async fn actual_1024_catalog_http_replay_and_offline_reopen() {
     logged_out.unwrap();
     removed.unwrap();
     result.unwrap().unwrap();
+}
+
+pub(super) fn generated_values() -> Vec<ObservationData> {
+    let mut values = (1..=32)
+        .map(|id| ObservationData::Owner {
+            owner: GithubOwner {
+                id: GithubAccountId::new(id).unwrap(),
+                kind: if id == 1 {
+                    GithubOwnerKind::User
+                } else {
+                    GithubOwnerKind::Organization
+                },
+                login: format!("generated-owner-{id}"),
+            },
+        })
+        .collect::<Vec<_>>();
+    values.extend((1..=1024).map(|id| ObservationData::Repository {
+        repository: RepositoryFact {
+            id: RepositoryId::new(id).unwrap(),
+            owner_id: GithubAccountId::new(1 + (id - 1) % 32).unwrap(),
+            name: format!("generated-repository-{id}"),
+            visibility: RepositoryVisibility::Private,
+            archived: false,
+            default_branch: Some("main".into()),
+        },
+    }));
+    values
 }
